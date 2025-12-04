@@ -17,10 +17,13 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
+	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -210,8 +213,50 @@ func (r *NamespaceQuotaReconciler) patchQuota(ctx context.Context, rq *corev1.Re
 		gpu.String(),
 	)
 
+	// send POST request with the yaml of the patched resourcequota to some endpoint URL
+	endpointURL := nsq.Spec.ClusterRef.EndpointServer
+	if endpointURL == "" {
+		return fmt.Errorf("clusterRef.endpointServer is empty")
+	}
+
+	// Send the patched ResourceQuota YAML
+	if err := postYAML(rq, endpointURL); err != nil {
+		return err
+	}
+
+	fmt.Printf("Successfully POSTed patched ResourceQuota YAML to %s\n", endpointURL)
+
 	// Apply patch
 	return r.Update(ctx, rq)
+}
+
+func postYAML(obj interface{}, url string) error {
+	// Convert object to YAML
+	data, err := yaml.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("failed to marshal object to YAML: %w", err)
+	}
+
+	// Prepare request
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-yaml")
+
+	// Send request
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to POST yaml: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Ensure success status
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("endpoint returned non-2xx status: %s", resp.Status)
+	}
+
+	return nil
 }
 
 // computeClusterFree is a helper that sums allocatable and subtracts requested

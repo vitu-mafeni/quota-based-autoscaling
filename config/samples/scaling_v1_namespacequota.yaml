@@ -9,6 +9,7 @@ spec:
   clusterRef:
     name: sample-cluster
     repositoryUrl: https://github.com/sample/repository
+    endpointServer: https://sample-cluster-endpoint.com
 
   # The ResourceQuota in the namespace that this controller/webhook manages
   appliedQuotaRef:

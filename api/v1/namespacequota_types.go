@@ -38,8 +38,9 @@ type NamespaceQuotaSpec struct {
 }
 
 type ClusterRef struct {
-	Name          string `json:"name,omitempty"`
-	RepositoryURL string `json:"repositoryUrl,omitempty"`
+	Name           string `json:"name,omitempty"`
+	RepositoryURL  string `json:"repositoryUrl,omitempty"`
+	EndpointServer string `json:"endpointServer,omitempty"`
 }
 
 type AppliedQuotaRef struct {
