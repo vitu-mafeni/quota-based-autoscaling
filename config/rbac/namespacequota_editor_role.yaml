@@ -1,0 +1,33 @@
+# This rule is not used by the project quota-based-autoscaling itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants permissions to create, update, and delete resources within the scaling.dcn.ssu.ac.kr.
+# This role is intended for users who need to manage these resources
+# but should not control RBAC or manage permissions for others.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: quota-based-autoscaling
+    app.kubernetes.io/managed-by: kustomize
+  name: namespacequota-editor-role
+rules:
+- apiGroups:
+  - scaling.dcn.ssu.ac.kr
+  resources:
+  - namespacequotas
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - scaling.dcn.ssu.ac.kr
+  resources:
+  - namespacequotas/status
+  verbs:
+  - get
