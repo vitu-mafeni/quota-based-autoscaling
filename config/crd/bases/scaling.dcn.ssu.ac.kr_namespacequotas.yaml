@@ -39,10 +39,66 @@ spec:
           spec:
             description: spec defines the desired state of NamespaceQuota
             properties:
-              foo:
+              appliedQuotaRef:
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    type: string
+                type: object
+              behavior:
+                properties:
+                  nodeScaling:
+                    description: NodeScaling config
+                    properties:
+                      enabled:
+                        type: boolean
+                      maxNodes:
+                        type: integer
+                      minNodes:
+                        type: integer
+                      nodeFlavor:
+                        type: string
+                      scaleUpCooldownSeconds:
+                        type: integer
+                      scaleUpThreshold:
+                        type: integer
+                    required:
+                    - enabled
+                    type: object
+                  quotaScaling:
+                    properties:
+                      enabled:
+                        type: boolean
+                      maxQuota:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      minQuota:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      mode:
+                        type: string
+                      scaleStep:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      targetQuotaUtilization:
+                        type: integer
+                    required:
+                    - enabled
+                    type: object
+                type: object
+              clusterRef:
                 description: foo is an example field of NamespaceQuota. Edit namespacequota_types.go
                   to remove/update
-                type: string
+                properties:
+                  name:
+                    type: string
+                  repositoryUrl:
+                    type: string
+                type: object
             type: object
           status:
             description: status defines the observed state of NamespaceQuota

@@ -6,4 +6,43 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: namespacequota-sample
 spec:
-  # TODO(user): Add fields here
+  clusterRef:
+    name: sample-cluster
+    repositoryUrl: https://github.com/sample/repository
+
+  # The ResourceQuota in the namespace that this controller/webhook manages
+  appliedQuotaRef:
+    namespace: sample-namespace
+    name: sample-appliedquota
+
+  behavior:
+  # Quota Scaling Logic — Increase quota first if cluster has free capacity
+    quotaScaling:
+      enabled: true
+
+      minQuota:                  # Lower bound for auto-patching quotas
+        cpu: "500m"
+        memory: "1Gi"
+        nvidia.com/gpu: "0"
+
+      maxQuota:                   # Upper bound controller will not exceed
+        cpu: "8"
+        memory: "16Gi"
+        nvidia.com/gpu: "4"
+
+      scaleStep:                  # Increment step for scaling quotas
+        cpu: "500m"
+        memory: "1Gi"
+        nvidia.com/gpu: "1"
+
+      targetQuotaUtilization: 70 # Trigger quota increase when usage > 70%
+
+
+    # Node Scaling Logic — If cluster has no free capacity
+    nodeScaling:
+      enabled: true
+      minNodes: 1
+      maxNodes: 5
+      nodeFlavor: standard-medium
+      scaleUpCooldownSeconds: 120   # Prevent rapid, repeated node scaling
+      scaleUpThreshold: 85          # Trigger node scale-up when allocatable usage > 85%

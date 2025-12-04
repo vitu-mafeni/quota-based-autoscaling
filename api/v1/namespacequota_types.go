@@ -32,7 +32,48 @@ type NamespaceQuotaSpec struct {
 
 	// foo is an example field of NamespaceQuota. Edit namespacequota_types.go to remove/update
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	ClusterRef      ClusterRef      `json:"clusterRef,omitempty"`
+	AppliedQuotaRef AppliedQuotaRef `json:"appliedQuotaRef,omitempty"`
+	Behavior        Behavior        `json:"behavior,omitempty"`
+}
+
+type ClusterRef struct {
+	Name          string `json:"name,omitempty"`
+	RepositoryURL string `json:"repositoryUrl,omitempty"`
+}
+
+type AppliedQuotaRef struct {
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name,omitempty"`
+}
+
+type Behavior struct {
+	QuotaScaling QuotaScaling `json:"quotaScaling,omitempty"`
+	NodeScaling  NodeScaling  `json:"nodeScaling,omitempty"`
+}
+
+type QuotaScaling struct {
+	Enabled                bool              `json:"enabled"`
+	MinQuota               map[string]string `json:"minQuota,omitempty"`               // resourceName -> quantity (string)
+	MaxQuota               map[string]string `json:"maxQuota,omitempty"`               // resourceName -> quantity
+	ScaleStep              map[string]string `json:"scaleStep,omitempty"`              // resourceName -> quantity
+	TargetQuotaUtilization int               `json:"targetQuotaUtilization,omitempty"` // percent
+	Mode                   string            `json:"mode,omitempty"`                   // either|both|cpu-only|memory-only (optional)
+}
+
+type ResourceQuota struct {
+	CPU    string `json:"cpu,omitempty"`
+	Memory string `json:"memory,omitempty"`
+}
+
+// NodeScaling config
+type NodeScaling struct {
+	Enabled                bool   `json:"enabled"`
+	MinNodes               int    `json:"minNodes,omitempty"`
+	MaxNodes               int    `json:"maxNodes,omitempty"`
+	NodeFlavor             string `json:"nodeFlavor,omitempty"`
+	ScaleUpCooldownSeconds int    `json:"scaleUpCooldownSeconds,omitempty"`
+	ScaleUpThreshold       int    `json:"scaleUpThreshold,omitempty"`
 }
 
 // NamespaceQuotaStatus defines the observed state of NamespaceQuota.
