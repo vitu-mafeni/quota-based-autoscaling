@@ -25,13 +25,16 @@ import (
 
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	scalingv1 "github.com/vitumafeni/quota-based-scaling/api/v1"
 )
@@ -392,10 +395,22 @@ func triggerScaleUpForCluster(spec scalingv1.NamespaceQuotaSpec) error {
 	return nil
 }
 
+// func (r *NamespaceQuotaReconciler) mapClusterToClusterPolicy(obj client.Object) []reconcile.Request {
+// 	return []reconcile.Request{}
+// }
+
 // SetupWithManager sets up the controller with the Manager.
+func (r *NamespaceQuotaReconciler) watchResourceQuotaToNamespaceQuotas(ctx context.Context, obj client.Object) []reconcile.Request {
+	return []reconcile.Request{}
+}
+
 func (r *NamespaceQuotaReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&scalingv1.NamespaceQuota{}).
+		Watches(
+			&v1.ResourceQuota{},
+			handler.EnqueueRequestsFromMapFunc(r.watchResourceQuotaToNamespaceQuotas),
+		).
 		Named("namespacequota").
 		Complete(r)
 }
