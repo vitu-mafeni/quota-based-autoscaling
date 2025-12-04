@@ -198,12 +198,18 @@ func (r *NamespaceQuotaReconciler) patchQuota(ctx context.Context, rq *corev1.Re
 	}
 
 	// print the new whole complete quotas resource for logging
-	fmt.Printf("Patching ResourceQuota %s/%s: new hard quotas: CPU=%s, Memory=%s, GPU=%s\n",
+	cpu := rq.Spec.Hard[corev1.ResourceLimitsCPU]
+	mem := rq.Spec.Hard[corev1.ResourceLimitsMemory]
+	gpu := rq.Spec.Hard[corev1.ResourceName("nvidia.com/gpu")]
+
+	fmt.Printf(
+		"Patching ResourceQuota %s/%s: CPU=%s, Memory=%s, GPU=%s\n",
 		rq.Namespace, rq.Name,
-		rq.Spec.Hard[corev1.ResourceLimitsCPU],
-		rq.Spec.Hard[corev1.ResourceLimitsMemory],
-		rq.Spec.Hard["nvidia.com/gpu"],
+		cpu.String(),
+		mem.String(),
+		gpu.String(),
 	)
+
 	// Apply patch
 	return r.Update(ctx, rq)
 }
