@@ -94,6 +94,8 @@ spec:
                 description: foo is an example field of NamespaceQuota. Edit namespacequota_types.go
                   to remove/update
                 properties:
+                  endpointServer:
+                    type: string
                   name:
                     type: string
                   repositoryUrl:

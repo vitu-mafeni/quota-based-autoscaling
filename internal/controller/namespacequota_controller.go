@@ -21,9 +21,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -45,29 +47,27 @@ type NamespaceQuotaReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+// RBAC
 // +kubebuilder:rbac:groups=scaling.dcn.ssu.ac.kr,resources=namespacequotas,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=scaling.dcn.ssu.ac.kr,resources=namespacequotas/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=scaling.dcn.ssu.ac.kr,resources=namespacequotas/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the NamespaceQuota object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
 func (r *NamespaceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	logger.Info("------------------ Starting reconciliation", "request", req.NamespacedName)
 
 	var nsq scalingv1.NamespaceQuota
 	if err := r.Get(ctx, req.NamespacedName, &nsq); err != nil {
 		if errors.IsNotFound(err) {
+			logger.Info("NamespaceQuota resource not found. Ignoring since object must be deleted.")
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
+
+	logger.Info("Reconciling NamespaceQuota", "nsq", req.NamespacedName)
 
 	// 1) Read the ResourceQuota referenced
 	var rq corev1.ResourceQuota
@@ -78,34 +78,107 @@ func (r *NamespaceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
+	// Detect recent quota exceeded events (pod admission denied)
+	quotaDenied, err := r.DetectQuotaExceeded(ctx, &rq)
+	if err != nil {
+		logger.Error(err, "failed to list events")
+	}
+
 	// 2) Compute usage vs hard
 	usedCPU := GetUsedCPU(&rq)
 	hardCPU := GetHardCPU(&rq)
 	usedMem := GetUsedMemory(&rq)
 	hardMem := GetHardMemory(&rq)
 
-	utilizationCPU := int((usedCPU * 100) / hardCPU)
-	utilizationMem := int((usedMem * 100) / hardMem)
+	utilizationCPU := 0
+	utilizationMem := 0
+
+	if hardCPU > 0 {
+		utilizationCPU = int((usedCPU * 100) / hardCPU)
+	}
+
+	if hardMem > 0 {
+		utilizationMem = int((usedMem * 100) / hardMem)
+	}
 
 	logger.Info("ResourceQuota utilization", "namespace", rq.Namespace, "name", rq.Name,
 		"usedCPU(m)", usedCPU, "hardCPU(m)", hardCPU, "utilCPU(%)", utilizationCPU,
-		"usedMem(bytes)", usedMem, "hardMem(bytes)", hardMem, "utilMem(%)", utilizationMem)
+		"usedMem(bytes)", usedMem, "hardMem(bytes)", hardMem, "utilMem(%)", utilizationMem,
+		"quotaDenied", quotaDenied)
 
-	// 3) If utilization exceeds targetQuotaUtilization → attempt quota patch or node scale
-	// 3) If utilization exceeds targetQuotaUtilization → attempt quota patch or node scale
+	// Determine target
 	target := int64(nsq.Spec.Behavior.QuotaScaling.TargetQuotaUtilization)
 
+	// Primary path: quota prevented pod creation -> try quota patch or node scale immediately
+	if quotaDenied {
+		logger.Info("Detected quota denial event — treating as immediate shortage")
+
+		// attempt to compute required step sizes from CR; if absent, fallback to sensible defaults
+		stepCPU, errCPU := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, corev1.ResourceCPU.String())
+		if errCPU != nil {
+			// fallback default: 500m
+			logger.Info("CPU scaleStep missing or invalid; using default 500m")
+			stepCPU = 500
+		}
+
+		stepMem, errMem := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, corev1.ResourceMemory.String())
+		if errMem != nil {
+			logger.Info("Memory scaleStep missing or invalid; using default 512Mi")
+			stepMem = 512 * 1024 * 1024
+		}
+
+		stepGPU, _ := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, "nvidia.com/gpu")
+
+		// Free cluster capacity
+		freeCPU, freeMem, freeGPU, err := computeClusterFree(ctx, r.Client)
+		if err != nil {
+			logger.Error(err, "failed to compute cluster free resources")
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+
+		// safety margin (20%)
+		safetyCPU := stepCPU + (stepCPU / 5)
+		safetyMem := stepMem + (stepMem / 5)
+		safetyGPU := stepGPU + (stepGPU / 5)
+
+		if freeCPU >= safetyCPU || freeMem >= safetyMem || freeGPU >= safetyGPU {
+			logger.Info("Cluster has free resources, attempting quota patch (quotaDenied path)")
+
+			if err := r.patchQuota(ctx, &rq, stepCPU, stepMem, stepGPU, &nsq); err != nil {
+				logger.Error(err, "failed to patch quota")
+				return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
+			}
+
+			logger.Info("Successfully patched ResourceQuota")
+			return ctrl.Result{}, nil
+		}
+
+		// Otherwise → cluster scale-up
+		if nsq.Spec.Behavior.NodeScaling.Enabled {
+			logger.Info("Not enough free capacity - triggering node scale-up (quotaDenied path)")
+
+			if err := triggerScaleUpForCluster(nsq.Spec); err != nil {
+				logger.Error(err, "failed to trigger scale-up")
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+
+			logger.Info("Scale-up request sent")
+			return ctrl.Result{}, nil
+		}
+	}
+
+	// Secondary path: utilization-based proactive scaling
 	if int64(utilizationCPU) >= target || int64(utilizationMem) >= target {
-		logger.Info("Quota utilization above target", "CPU (%)", utilizationCPU, "MEM (%)", utilizationMem)
+		logger.Info("Quota utilization above target — proactive scaling", "CPU (%)", utilizationCPU, "MEM (%)", utilizationMem)
 
 		// ScaleStep parsing from map[string]string
-		stepCPU, err := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, corev1.ResourceCPU.String())
+		stepCPU, err := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, corev1.ResourceLimitsCPU.String())
 		if err != nil {
 			logger.Error(err, "missing CPU scaleStep quantity")
 			return ctrl.Result{}, nil
 		}
 
-		stepMem, err := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, corev1.ResourceMemory.String())
+		stepMem, err := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, corev1.ResourceLimitsMemory.String())
 		if err != nil {
 			logger.Error(err, "missing Memory scaleStep quantity")
 			return ctrl.Result{}, nil
@@ -127,7 +200,7 @@ func (r *NamespaceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		safetyGPU := stepGPU + (stepGPU / 5)
 
 		if freeCPU >= safetyCPU || freeMem >= safetyMem || freeGPU >= safetyGPU {
-			logger.Info("Cluster has free resources, attempting quota patch")
+			logger.Info("Cluster has free resources, attempting quota patch (utilization path)")
 
 			if err := r.patchQuota(ctx, &rq, stepCPU, stepMem, stepGPU, &nsq); err != nil {
 				logger.Error(err, "failed to patch quota")
@@ -140,7 +213,7 @@ func (r *NamespaceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 		// Otherwise → cluster scale-up
 		if nsq.Spec.Behavior.NodeScaling.Enabled {
-			logger.Info("Not enough free capacity → triggering node scale-up")
+			logger.Info("Not enough free capacity → triggering node scale-up (utilization path)")
 
 			if err := triggerScaleUpForCluster(nsq.Spec); err != nil {
 				logger.Error(err, "failed to trigger scale-up")
@@ -158,16 +231,17 @@ func (r *NamespaceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 func (r *NamespaceQuotaReconciler) patchQuota(ctx context.Context, rq *corev1.ResourceQuota, stepCPU, stepMem, stepGPU int64, nsq *scalingv1.NamespaceQuota) error {
 	// Read current hard values
-	// current hard values
 	curCPU := rq.Spec.Hard[corev1.ResourceLimitsCPU]
 	curMem := rq.Spec.Hard[corev1.ResourceLimitsMemory]
 	curGPU := rq.Spec.Hard["nvidia.com/gpu"]
+
 	// desired = current + step
 	newCPU := curCPU.DeepCopy()
 	newCPU.Add(*resource.NewMilliQuantity(stepCPU, resource.DecimalSI))
 
 	newMem := curMem.DeepCopy()
-	newMem.Add(*resource.NewMilliQuantity(stepMem, resource.BinarySI))
+	// stepMem is bytes (BinarySI)
+	newMem.Add(*resource.NewQuantity(stepMem, resource.BinarySI))
 
 	if stepGPU > 0 {
 		newGPU := curGPU.DeepCopy()
@@ -215,6 +289,9 @@ func (r *NamespaceQuotaReconciler) patchQuota(ctx context.Context, rq *corev1.Re
 		mem.String(),
 		gpu.String(),
 	)
+
+	// print the whole patched ResourceQuota for logging
+	fmt.Printf("Patched ResourceQuota: %+v\n", rq)
 
 	// send POST request with the yaml of the patched resourcequota to some endpoint URL
 	endpointURL := nsq.Spec.ClusterRef.EndpointServer
@@ -334,57 +411,133 @@ func parseScaledQuantity(m map[string]string, key string) (int64, error) {
 	if !ok || val == "" {
 		return 0, fmt.Errorf("scaleStep missing key %s", key)
 	}
+
 	q, err := resource.ParseQuantity(val)
 	if err != nil {
 		return 0, fmt.Errorf("invalid quantity for %s: %v", key, err)
 	}
-	return q.MilliValue(), nil // CPU → milli-core, Memory → milli-bytes (convert later if needed)
+
+	switch key {
+	case "cpu":
+		return q.MilliValue(), nil
+	case "memory":
+		return q.Value(), nil
+	default:
+		// Future extensible: GPU, ephemeral-storage, and others
+		// Use Value() by default, but log a warning
+		return q.Value(), nil
+	}
 }
 
 // Reads used CPU from ResourceQuota.Status.Used
 func GetUsedCPU(rq *corev1.ResourceQuota) int64 {
-	// Change to "limits.cpu" if that is your quota key
-	key := corev1.ResourceCPU
-
-	qty, ok := rq.Status.Used[key]
-	if !ok {
-		return 0
+	// check limits.cpu then requests.cpu
+	if qty, ok := rq.Status.Used[corev1.ResourceName("limits.cpu")]; ok {
+		return qty.MilliValue()
 	}
-	return qty.MilliValue()
+	if qty, ok := rq.Status.Used[corev1.ResourceName("requests.cpu")]; ok {
+		return qty.MilliValue()
+	}
+	return 0
 }
 
 // Reads hard CPU from ResourceQuota.Spec.Hard
 func GetHardCPU(rq *corev1.ResourceQuota) int64 {
-	// Change to "limits.cpu" if needed
-	key := corev1.ResourceCPU
-
-	qty, ok := rq.Spec.Hard[key]
-	if !ok {
-		return 0
+	if qty, ok := rq.Spec.Hard[corev1.ResourceName("limits.cpu")]; ok {
+		return qty.MilliValue()
 	}
-	return qty.MilliValue()
+	if qty, ok := rq.Spec.Hard[corev1.ResourceName("requests.cpu")]; ok {
+		return qty.MilliValue()
+	}
+	return 0
 }
 
 func GetUsedMemory(rq *corev1.ResourceQuota) int64 {
-	// Change to "limits.memory" if needed
-	key := corev1.ResourceMemory
-
-	qty, ok := rq.Status.Used[key]
-	if !ok {
-		return 0
+	// prefer limits.memory then requests.memory
+	if qty, ok := rq.Status.Used[corev1.ResourceName("limits.memory")]; ok {
+		return qty.Value()
 	}
-	return qty.Value() // bytes
+	if qty, ok := rq.Status.Used[corev1.ResourceName("requests.memory")]; ok {
+		return qty.Value()
+	}
+	return 0
 }
 
 // Reads hard memory from ResourceQuota.Spec.Hard
 func GetHardMemory(rq *corev1.ResourceQuota) int64 {
-	key := corev1.ResourceMemory
-
-	qty, ok := rq.Spec.Hard[key]
-	if !ok {
-		return 0
+	if qty, ok := rq.Spec.Hard[corev1.ResourceName("limits.memory")]; ok {
+		return qty.Value()
 	}
-	return qty.Value() // bytes
+	if qty, ok := rq.Spec.Hard[corev1.ResourceName("requests.memory")]; ok {
+		return qty.Value()
+	}
+	return 0
+}
+
+// Detect whether a recent event indicates quota exceeded for this ResourceQuota
+// DetectQuotaExceeded attempts multiple signals to determine whether
+// quota exhaustion is blocking pod creation in the namespace.
+func (r *NamespaceQuotaReconciler) DetectQuotaExceeded(ctx context.Context, rq *corev1.ResourceQuota) (bool, error) {
+	// Check ResourceQuota status usage
+	hardCPU := rq.Status.Hard.Cpu().MilliValue()
+	usedCPU := rq.Status.Used.Cpu().MilliValue()
+
+	hardMem := rq.Status.Hard.Memory().Value()
+	usedMem := rq.Status.Used.Memory().Value()
+
+	// Guard against zero values — no quota set
+	if hardCPU > 0 && usedCPU >= hardCPU {
+		return true, nil
+	}
+	if hardMem > 0 && usedMem >= hardMem {
+		return true, nil
+	}
+
+	// Check Deployment/ReplicaSet failure conditions in namespace
+	var depList appsv1.DeploymentList
+	if err := r.List(ctx, &depList, client.InNamespace(rq.Namespace)); err == nil {
+		for _, dep := range depList.Items {
+			for _, cond := range dep.Status.Conditions {
+				if cond.Type == appsv1.DeploymentReplicaFailure &&
+					strings.Contains(strings.ToLower(cond.Message), "quota") {
+					return true, nil
+				}
+			}
+		}
+	}
+
+	var rsList appsv1.ReplicaSetList
+	if err := r.List(ctx, &rsList, client.InNamespace(rq.Namespace)); err == nil {
+		for _, rs := range rsList.Items {
+			for _, cond := range rs.Status.Conditions {
+				if cond.Type == appsv1.ReplicaSetReplicaFailure &&
+					strings.Contains(strings.ToLower(cond.Message), "quota") {
+					return true, nil
+				}
+			}
+		}
+	}
+
+	// Fallback → Check for recent FailedCreate events
+	var evList corev1.EventList
+	if err := r.List(ctx, &evList, client.InNamespace(rq.Namespace)); err == nil {
+		now := time.Now()
+		for _, ev := range evList.Items {
+			if ev.Type != corev1.EventTypeWarning {
+				continue
+			}
+			msg := strings.ToLower(ev.Message)
+			if ev.Reason != "FailedCreate" && !strings.Contains(msg, "exceeded quota") {
+				continue
+			}
+			if now.Sub(ev.LastTimestamp.Time) <= 2*time.Minute {
+				return true, nil
+			}
+		}
+	}
+
+	// Nothing detected — quota OK
+	return false, nil
 }
 
 // triggerScaleUpForCluster is a stub that would call cloud provider APIs
@@ -395,22 +548,52 @@ func triggerScaleUpForCluster(spec scalingv1.NamespaceQuotaSpec) error {
 	return nil
 }
 
-// func (r *NamespaceQuotaReconciler) mapClusterToClusterPolicy(obj client.Object) []reconcile.Request {
-// 	return []reconcile.Request{}
-// }
-
 // SetupWithManager sets up the controller with the Manager.
 func (r *NamespaceQuotaReconciler) watchResourceQuotaToNamespaceQuotas(ctx context.Context, obj client.Object) []reconcile.Request {
-	return []reconcile.Request{}
+	// Map ResourceQuota changes to NamespaceQuota CRs in the same namespace that reference it
+	rq := obj.(*corev1.ResourceQuota)
+	var out []reconcile.Request
+	var list scalingv1.NamespaceQuotaList
+	if err := r.List(context.Background(), &list, client.InNamespace(rq.Namespace)); err != nil {
+		return nil
+	}
+	for _, nsq := range list.Items {
+		if nsq.Spec.AppliedQuotaRef.Name == rq.Name && nsq.Spec.AppliedQuotaRef.Namespace == rq.Namespace {
+			out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsq.Namespace, Name: nsq.Name}})
+		}
+	}
+	return out
 }
 
+func (r *NamespaceQuotaReconciler) watchEventToNamespaceQuotas(obj client.Object) []reconcile.Request {
+	ev := obj.(*corev1.Event)
+	if ev.Type != corev1.EventTypeWarning {
+		return nil
+	}
+	if ev.Reason != "FailedCreate" && !strings.Contains(strings.ToLower(ev.Message), "exceeded quota") {
+		return nil
+	}
+
+	// find NamespaceQuota CRs in the event namespace and enqueue them (cheap if few)
+	var out []reconcile.Request
+	var list scalingv1.NamespaceQuotaList
+	if err := r.List(context.Background(), &list, client.InNamespace(ev.InvolvedObject.Namespace)); err != nil {
+		return nil
+	}
+	for _, nsq := range list.Items {
+		// only enqueue if the ResourceQuota name appears in the event message or if the NSQ references a quota in this namespace
+		if strings.Contains(ev.Message, nsq.Spec.AppliedQuotaRef.Name) || nsq.Spec.AppliedQuotaRef.Namespace == ev.InvolvedObject.Namespace {
+			out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsq.Namespace, Name: nsq.Name}})
+		}
+	}
+	return out
+}
 func (r *NamespaceQuotaReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&scalingv1.NamespaceQuota{}).
-		Watches(
-			&v1.ResourceQuota{},
-			handler.EnqueueRequestsFromMapFunc(r.watchResourceQuotaToNamespaceQuotas),
-		).
-		Named("namespacequota").
-		Complete(r)
+		For(
+			&scalingv1.NamespaceQuota{}).
+		Watches(&v1.ResourceQuota{},
+			handler.EnqueueRequestsFromMapFunc(
+				r.watchResourceQuotaToNamespaceQuotas)).
+		Named("namespacequota").Complete(r)
 }

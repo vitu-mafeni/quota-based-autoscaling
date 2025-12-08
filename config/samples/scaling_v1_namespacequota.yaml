@@ -5,6 +5,7 @@ metadata:
     app.kubernetes.io/name: quota-based-autoscaling
     app.kubernetes.io/managed-by: kustomize
   name: namespacequota-sample
+  namespace: quota-test
 spec:
   clusterRef:
     name: sample-cluster
@@ -13,29 +14,25 @@ spec:
 
   # The ResourceQuota in the namespace that this controller/webhook manages
   appliedQuotaRef:
-    namespace: sample-namespace
+    namespace: quota-test
     name: sample-appliedquota
 
   behavior:
   # Quota Scaling Logic — Increase quota first if cluster has free capacity
     quotaScaling:
       enabled: true
-
       minQuota:                  # Lower bound for auto-patching quotas
         cpu: "500m"
-        memory: "1Gi"
-        nvidia.com/gpu: "0"
-
+        memory: "512Mi"
+        # nvidia.com/gpu: "0"
       maxQuota:                   # Upper bound controller will not exceed
-        cpu: "8"
-        memory: "16Gi"
-        nvidia.com/gpu: "4"
-
+        cpu: "3"
+        memory: "3Gi"
+        # nvidia.com/gpu: "4"
       scaleStep:                  # Increment step for scaling quotas
         cpu: "500m"
-        memory: "1Gi"
-        nvidia.com/gpu: "1"
-
+        memory: "512Mi"
+        # nvidia.com/gpu: "1"
       targetQuotaUtilization: 70 # Trigger quota increase when usage > 70%
 
 
@@ -45,5 +42,5 @@ spec:
       minNodes: 1
       maxNodes: 5
       nodeFlavor: standard-medium
-      scaleUpCooldownSeconds: 120   # Prevent rapid, repeated node scaling
-      scaleUpThreshold: 85          # Trigger node scale-up when allocatable usage > 85%
+      scaleUpCooldownSeconds: 85   # Prevent rapid, repeated node scaling
+      scaleUpThreshold: 70          # Trigger node scale-up when allocatable usage > 70%
