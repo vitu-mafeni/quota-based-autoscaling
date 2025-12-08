@@ -30,6 +30,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -229,7 +230,12 @@ func (r *NamespaceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return ctrl.Result{}, nil
 }
 
-func (r *NamespaceQuotaReconciler) patchQuota(ctx context.Context, rq *corev1.ResourceQuota, stepCPU, stepMem, stepGPU int64, nsq *scalingv1.NamespaceQuota) error {
+func (r *NamespaceQuotaReconciler) patchQuota(
+	ctx context.Context,
+	rq *corev1.ResourceQuota,
+	stepCPU, stepMem, stepGPU int64,
+	nsq *scalingv1.NamespaceQuota,
+) error {
 	// Read current hard values
 	curCPU := rq.Spec.Hard[corev1.ResourceLimitsCPU]
 	curMem := rq.Spec.Hard[corev1.ResourceLimitsMemory]
@@ -240,7 +246,6 @@ func (r *NamespaceQuotaReconciler) patchQuota(ctx context.Context, rq *corev1.Re
 	newCPU.Add(*resource.NewMilliQuantity(stepCPU, resource.DecimalSI))
 
 	newMem := curMem.DeepCopy()
-	// stepMem is bytes (BinarySI)
 	newMem.Add(*resource.NewQuantity(stepMem, resource.BinarySI))
 
 	if stepGPU > 0 {
@@ -257,7 +262,8 @@ func (r *NamespaceQuotaReconciler) patchQuota(ctx context.Context, rq *corev1.Re
 	if ok && maxCPUQty != "" {
 		maxCPU := parseQuantityMilli(maxCPUQty)
 		if newCPU.MilliValue() > maxCPU {
-			return fmt.Errorf("new CPU quota %dm exceeds maxQuota %dm", newCPU.MilliValue(), maxCPU)
+			return fmt.Errorf("new CPU quota %dm exceeds maxQuota %dm",
+				newCPU.MilliValue(), maxCPU)
 		}
 	}
 
@@ -265,15 +271,18 @@ func (r *NamespaceQuotaReconciler) patchQuota(ctx context.Context, rq *corev1.Re
 	if ok && maxMemQty != "" {
 		maxMem := parseQuantityBytes(maxMemQty)
 		if newMem.Value() > maxMem {
-			return fmt.Errorf("new Memory quota %d bytes exceeds maxQuota %d bytes", newMem.Value(), maxMem)
+			return fmt.Errorf("new Memory quota %d bytes exceeds maxQuota %d bytes",
+				newMem.Value(), maxMem)
 		}
 	}
+
 	maxGPUQty, ok := nsq.Spec.Behavior.QuotaScaling.MaxQuota["nvidia.com/gpu"]
 	if ok && maxGPUQty != "" && stepGPU > 0 {
 		maxGPU := parseQuantityMilli(maxGPUQty)
 		newGPU := rq.Spec.Hard["nvidia.com/gpu"]
 		if newGPU.MilliValue() > maxGPU {
-			return fmt.Errorf("new GPU quota %dm exceeds maxQuota %dm", newGPU.MilliValue(), maxGPU)
+			return fmt.Errorf("new GPU quota %dm exceeds maxQuota %dm",
+				newGPU.MilliValue(), maxGPU)
 		}
 	}
 
@@ -282,16 +291,38 @@ func (r *NamespaceQuotaReconciler) patchQuota(ctx context.Context, rq *corev1.Re
 	mem := rq.Spec.Hard[corev1.ResourceLimitsMemory]
 	gpu := rq.Spec.Hard[corev1.ResourceName("nvidia.com/gpu")]
 
+	postRQ := &corev1.ResourceQuota{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ResourceQuota",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      rq.Name,
+			Namespace: rq.Namespace,
+		},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceLimitsCPU:    rq.Spec.Hard[corev1.ResourceLimitsCPU],
+				corev1.ResourceLimitsMemory: rq.Spec.Hard[corev1.ResourceLimitsMemory],
+			},
+		},
+	}
+
+	if curGPU, ok := rq.Spec.Hard["nvidia.com/gpu"]; ok {
+		postRQ.Spec.Hard["nvidia.com/gpu"] = curGPU
+	}
+
+	postRQ.ObjectMeta.CreationTimestamp = metav1.Time{}
+
 	fmt.Printf(
 		"Patching ResourceQuota %s/%s: CPU=%s, Memory=%s, GPU=%s\n",
 		rq.Namespace, rq.Name,
-		cpu.String(),
-		mem.String(),
-		gpu.String(),
+		cpu.String(), mem.String(), gpu.String(),
 	)
 
 	// print the whole patched ResourceQuota for logging
-	fmt.Printf("Patched ResourceQuota: %+v\n", rq)
+	yamlBytes, _ := yaml.Marshal(postRQ)
+	fmt.Println("Sending minimal ResourceQuota YAML:\n" + string(yamlBytes))
 
 	// send POST request with the yaml of the patched resourcequota to some endpoint URL
 	endpointURL := nsq.Spec.ClusterRef.EndpointServer
@@ -300,7 +331,7 @@ func (r *NamespaceQuotaReconciler) patchQuota(ctx context.Context, rq *corev1.Re
 	}
 
 	// Send the patched ResourceQuota YAML
-	if err := postYAML(rq, endpointURL); err != nil {
+	if err := postYAML(postRQ, endpointURL); err != nil {
 		return err
 	}
 
