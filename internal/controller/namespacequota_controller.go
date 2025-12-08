@@ -321,8 +321,8 @@ func (r *NamespaceQuotaReconciler) patchQuota(
 	)
 
 	// print the whole patched ResourceQuota for logging
-	yamlBytes, _ := yaml.Marshal(postRQ)
-	fmt.Println("Sending minimal ResourceQuota YAML:\n" + string(yamlBytes))
+	// yamlBytes, _ := yaml.Marshal(postRQ)
+	// fmt.Println("Sending minimal ResourceQuota YAML:\n" + string(yamlBytes))
 
 	// send POST request with the yaml of the patched resourcequota to some endpoint URL
 	endpointURL := nsq.Spec.ClusterRef.EndpointServer
@@ -371,14 +371,53 @@ func postYAML(obj interface{}, url string) error {
 }
 
 // computeClusterFree is a helper that sums allocatable and subtracts requested
+// computeClusterFree returns free CPU (milli), free Mem (bytes), free GPU (count)
+// It excludes control-plane / unschedulable nodes by:
+//   - skipping nodes with Spec.Unschedulable == true
+//   - skipping nodes that have taints typically used for control-plane/master (NoSchedule)
 func computeClusterFree(ctx context.Context, c client.Client) (int64, int64, int64, error) {
 	var nodeList corev1.NodeList
 	if err := c.List(ctx, &nodeList); err != nil {
 		return 0, 0, 0, err
 	}
 
+	// helper to detect control-plane/master taints
+	isControlTaint := func(t corev1.Taint) bool {
+		// common control-plane taint keys; adapt if your cluster uses different keys
+		switch t.Key {
+		case "node-role.kubernetes.io/control-plane",
+			"node-role.kubernetes.io/master",
+			"node.kubernetes.io/master":
+			return true
+		default:
+			return false
+		}
+	}
+
+	workerNodes := make(map[string]struct{})
 	var allocCPU, allocMem, allocGPU int64
+
 	for _, n := range nodeList.Items {
+		// skip explicitly unschedulable nodes
+		if n.Spec.Unschedulable {
+			continue
+		}
+
+		// skip if any NoSchedule control-plane/master taint present
+		skip := false
+		for _, t := range n.Spec.Taints {
+			if isControlTaint(t) && (t.Effect == corev1.TaintEffectNoSchedule || t.Effect == corev1.TaintEffectPreferNoSchedule) {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+
+		// This node is considered a worker for our calculations
+		workerNodes[n.Name] = struct{}{}
+
 		if cpu := n.Status.Allocatable[corev1.ResourceCPU]; cpu.Value() > 0 {
 			allocCPU += cpu.MilliValue()
 		}
@@ -390,6 +429,7 @@ func computeClusterFree(ctx context.Context, c client.Client) (int64, int64, int
 		}
 	}
 
+	// List pods cluster-wide and sum only those scheduled on worker nodes
 	var podList corev1.PodList
 	if err := c.List(ctx, &podList); err != nil {
 		return 0, 0, 0, err
@@ -397,10 +437,22 @@ func computeClusterFree(ctx context.Context, c client.Client) (int64, int64, int
 
 	var usedCPU, usedMem, usedGPU int64
 	for _, p := range podList.Items {
+		// skip terminated pods
 		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
 
+		// skip pods not yet scheduled (they don't consume node allocatable)
+		if p.Spec.NodeName == "" {
+			continue
+		}
+
+		// only count pods that are scheduled onto considered worker nodes
+		if _, ok := workerNodes[p.Spec.NodeName]; !ok {
+			continue
+		}
+
+		// sum container requests
 		for _, ctr := range p.Spec.Containers {
 			if cpu, exists := ctr.Resources.Requests[corev1.ResourceCPU]; exists {
 				usedCPU += cpu.MilliValue()
@@ -412,11 +464,44 @@ func computeClusterFree(ctx context.Context, c client.Client) (int64, int64, int
 				usedGPU += gpu.Value()
 			}
 		}
+		// include init containers too (they contribute to requests at runtime)
+		for _, ict := range p.Spec.InitContainers {
+			if cpu, exists := ict.Resources.Requests[corev1.ResourceCPU]; exists {
+				usedCPU += cpu.MilliValue()
+			}
+			if mem, exists := ict.Resources.Requests[corev1.ResourceMemory]; exists {
+				usedMem += mem.Value()
+			}
+			if gpu, exists := ict.Resources.Requests["nvidia.com/gpu"]; exists {
+				usedGPU += gpu.Value()
+			}
+		}
 	}
 
 	freeCPU := allocCPU - usedCPU
 	freeMem := allocMem - usedMem
 	freeGPU := allocGPU - usedGPU
+
+	// Defensive: don't return negative free values
+	if freeCPU < 0 {
+		freeCPU = 0
+	}
+	if freeMem < 0 {
+		freeMem = 0
+	}
+	if freeGPU < 0 {
+		freeGPU = 0
+	}
+
+	// debug log: which nodes we considered (optional)
+	// build a small slice to print
+	var nodes []string
+	for n := range workerNodes {
+		nodes = append(nodes, n)
+	}
+	fmt.Printf("Counted worker nodes: %v\n", nodes)
+	fmt.Printf("Cluster allocatable (workers only): CPU=%dm, Mem=%d bytes, GPU=%d\n", allocCPU, allocMem, allocGPU)
+	fmt.Printf("Cluster requested (workers only):   CPU=%dm, Mem=%d bytes, GPU=%d\n", usedCPU, usedMem, usedGPU)
 
 	return freeCPU, freeMem, freeGPU, nil
 }
@@ -577,6 +662,42 @@ func triggerScaleUpForCluster(spec scalingv1.NamespaceQuotaSpec) error {
 	// For now, just log and return nil
 	fmt.Println("[stub] triggerScaleUpForCluster called for clusterRef:", spec.ClusterRef.Name)
 	return nil
+}
+
+// map Deployment changes to NamespaceQuota CRs that reference a ResourceQuota
+func (r *NamespaceQuotaReconciler) watchDeploymentToNamespaceQuotas(obj client.Object) []reconcile.Request {
+	dep := obj.(*appsv1.Deployment)
+	var out []reconcile.Request
+
+	// find NamespaceQuota CRs in the deployment namespace
+	var list scalingv1.NamespaceQuotaList
+	if err := r.List(context.Background(), &list, client.InNamespace(dep.Namespace)); err != nil {
+		return nil
+	}
+	for _, nsq := range list.Items {
+		// if the NSQ references a ResourceQuota in this namespace, enqueue it
+		if nsq.Spec.AppliedQuotaRef.Namespace == dep.Namespace {
+			out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsq.Namespace, Name: nsq.Name}})
+		}
+	}
+	return out
+}
+
+// map ReplicaSet changes to NamespaceQuota CRs that reference a ResourceQuota
+func (r *NamespaceQuotaReconciler) watchReplicaSetToNamespaceQuotas(obj client.Object) []reconcile.Request {
+	rs := obj.(*appsv1.ReplicaSet)
+	var out []reconcile.Request
+
+	var list scalingv1.NamespaceQuotaList
+	if err := r.List(context.Background(), &list, client.InNamespace(rs.Namespace)); err != nil {
+		return nil
+	}
+	for _, nsq := range list.Items {
+		if nsq.Spec.AppliedQuotaRef.Namespace == rs.Namespace {
+			out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsq.Namespace, Name: nsq.Name}})
+		}
+	}
+	return out
 }
 
 // SetupWithManager sets up the controller with the Manager.

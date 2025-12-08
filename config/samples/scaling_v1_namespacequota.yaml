@@ -43,4 +43,4 @@ spec:
       maxNodes: 5
       nodeFlavor: standard-medium
       scaleUpCooldownSeconds: 85   # Prevent rapid, repeated node scaling
-      scaleUpThreshold: 70          # Trigger node scale-up when allocatable usage > 70%
+      scaleUpThreshold: 50          # Trigger node scale-up when allocatable usage > 50%

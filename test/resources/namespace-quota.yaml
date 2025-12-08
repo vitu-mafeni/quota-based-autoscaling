@@ -10,7 +10,8 @@ metadata:
   namespace: quota-test
 spec:
   hard:
-    limits.cpu: "500m"
-    limits.memory: "512Mi"
-    # requests.cpu: "1500m"
-    # requests.memory: "512Mi"
+    requests.cpu: "2"       # Limit very low
+    limits.cpu: "4"
+    requests.memory: "4Gi"
+    limits.memory: "6Gi"
+    pods: "20"

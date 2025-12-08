@@ -19,9 +19,10 @@ spec:
         image: polinux/stress
         args: ["--cpu", "4"]
         resources:
-          limits:
-            cpu: "1000m"
-            memory: "512Mi"
           requests:
-            cpu: "1000m"
-            memory: "512Mi"
+            cpu: "10000m"      # 10 cores request
+            memory: "32Gi"     # 32Gi request
+          limits:
+            cpu: "10000m"      # same as request
+            memory: "32Gi"
+# controller logic is based on ResourceQuota violation, NOT top usage.
