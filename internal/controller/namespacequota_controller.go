@@ -169,7 +169,7 @@ func (r *NamespaceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		logger.Info("No quota denial events detected; skipping immediate quota patch")
 		shortage, msg, _ := detectWorkloadShortage(ctx, r.Client, req.Namespace)
 		if shortage {
-			logger.Info("❌ Resource Shortage Detected → Scale Node or Patch Quota", "reason", msg)
+			logger.Info("Resource Shortage Detected → Scale Node or Patch Quota", "reason", msg)
 			// Trigger your quota patching / node autoscaling logic here
 		}
 
@@ -606,11 +606,63 @@ func (r *NamespaceQuotaReconciler) DetectQuotaExceeded(ctx context.Context, rq *
 	return false, nil
 }
 
-// triggerScaleUpForCluster is a stub that would call cloud provider APIs
-func triggerScaleUpForCluster(spec scalingv1.NamespaceQuotaSpec) error {
-	// TODO: implement provider-specific scale-up (ASG API, GKE node pool resize, OpenStack heat)
-	// For now, just log and return nil
-	fmt.Println("[stub] triggerScaleUpForCluster called for clusterRef:", spec.ClusterRef.Name)
+func (r *NamespaceQuotaReconciler) TriggerScaleUpForCluster(namespace string) error {
+	ctx := context.Background()
+	logger := log.FromContext(ctx)
+
+	// Find NamespaceQuota in the namespace
+	var list scalingv1.NamespaceQuotaList
+	if err := r.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+		return fmt.Errorf("failed listing: %w", err)
+	}
+
+	if len(list.Items) == 0 {
+		return fmt.Errorf("no NamespaceQuota found in namespace %q", namespace)
+	}
+	if len(list.Items) > 1 {
+		return fmt.Errorf("multiple NamespaceQuota resources found in namespace %q, only one should exist", namespace)
+	}
+
+	n := list.Items[0]
+	logger.Info("Resolved NamespaceQuota", "namespace", namespace, "name", n.Name)
+
+	// Re-fetch owned object before modifying
+	var nsq scalingv1.NamespaceQuota
+	key := types.NamespacedName{Name: n.Name, Namespace: n.Namespace}
+	if err := r.Get(ctx, key, &nsq); err != nil {
+		return err
+	}
+
+	now := metav1.Now()
+
+	// Protect from nil LastUpdated
+	if nsq.Status.LastUpdated != nil {
+		diff := now.Sub(nsq.Status.LastUpdated.Time)
+		if diff.Minutes() < 5 {
+			logger.Info("Skipping: Scale-up recently triggered",
+				"namespace", namespace,
+				"lastTriggered", nsq.Status.LastUpdated.Time)
+			return nil
+		}
+	}
+
+	// Update status first
+	nsq.Status.LastUpdated = &now
+	nsq.Status.Conditions = append(nsq.Status.Conditions, metav1.Condition{
+		Type:               "ScaleUpTriggered",
+		Status:             metav1.ConditionTrue,
+		Reason:             "QuotaResourceShortageDetected",
+		Message:            "Scale-up triggered due to quota resource shortage detected from events",
+		ObservedGeneration: nsq.Generation,
+		LastTransitionTime: now,
+	})
+
+	// Call external system status reflects the trigger
+	if err := postYAML(&nsq, nsq.Spec.ClusterRef.EndpointServer); err != nil {
+		return fmt.Errorf("scale-up API failed: %w", err)
+	}
+
+	logger.Info("Node Scaling triggered", "namespace", namespace)
 	return nil
 }
 
@@ -733,6 +785,10 @@ func (r *NamespaceQuotaReconciler) watchEventsCluster(ctx context.Context, obj c
 		logger.Info("Quota exceeded event detected", "eventNamespace", ev.InvolvedObject.Namespace, "namespaceQuotaObject", "eventMessage", ev.Message)
 	} else {
 		logger.Info("Resource outtage", "eventNamespace", ev.InvolvedObject.Namespace, "eventMessage", ev.Message)
+		err := r.TriggerScaleUpForCluster(ev.InvolvedObject.Namespace)
+		if err != nil {
+			logger.Error(err, "Failed to trigger scale up for cluster", "namespace", ev.InvolvedObject.Namespace)
+		}
 	}
 
 	// logger.Info("Event detected, enqueueing NamespaceQuota resources", "count", len(out), "eventNamespace", ev.InvolvedObject.Namespace, "eventMessage", ev.Message)
@@ -742,17 +798,17 @@ func (r *NamespaceQuotaReconciler) watchEventsCluster(ctx context.Context, obj c
 // this will watch the number of nodes in the cluster, will retrigger reconciliation of all NamespaceQuota resources that reference ResourceQuotas in any namespace
 func (r *NamespaceQuotaReconciler) watchNodesCluster(ctx context.Context, obj client.Object) []reconcile.Request {
 	// Map ResourceQuota changes to NamespaceQuota CRs in the same namespace that reference it
-	rq := obj.(*corev1.ResourceQuota)
+	// rq := obj.(*corev1.ResourceQuota)
 	var out []reconcile.Request
-	var list scalingv1.NamespaceQuotaList
-	if err := r.List(context.Background(), &list, client.InNamespace(rq.Namespace)); err != nil {
-		return nil
-	}
-	for _, nsq := range list.Items {
-		if nsq.Spec.AppliedQuotaRef.Name == rq.Name && nsq.Spec.AppliedQuotaRef.Namespace == rq.Namespace {
-			out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsq.Namespace, Name: nsq.Name}})
-		}
-	}
+	// var list scalingv1.NamespaceQuotaList
+	// if err := r.List(context.Background(), &list, client.InNamespace(rq.Namespace)); err != nil {
+	// 	return nil
+	// }
+	// for _, nsq := range list.Items {
+	// 	if nsq.Spec.AppliedQuotaRef.Name == rq.Name && nsq.Spec.AppliedQuotaRef.Namespace == rq.Namespace {
+	// 		out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsq.Namespace, Name: nsq.Name}})
+	// 	}
+	// }
 	return out
 }
 

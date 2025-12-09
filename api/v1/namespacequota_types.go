@@ -97,7 +97,8 @@ type NamespaceQuotaStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	// +optional
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	Conditions  []metav1.Condition `json:"conditions,omitempty"`
+	LastUpdated *metav1.Time       `json:"lastUpdated,omitempty"`
 }
 
 // +kubebuilder:object:root=true
