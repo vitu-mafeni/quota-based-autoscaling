@@ -15,7 +15,7 @@ spec:
   # The ResourceQuota in the namespace that this controller/webhook manages
   appliedQuotaRef:
     namespace: quota-test
-    name: sample-appliedquota
+    name: test-quota-small
 
   behavior:
   # Quota Scaling Logic — Increase quota first if cluster has free capacity
@@ -26,8 +26,8 @@ spec:
         memory: "512Mi"
         # nvidia.com/gpu: "0"
       maxQuota:                   # Upper bound controller will not exceed
-        cpu: "3"
-        memory: "3Gi"
+        cpu: "4000m"
+        memory: "4Gi"
         # nvidia.com/gpu: "4"
       scaleStep:                  # Increment step for scaling quotas
         cpu: "500m"

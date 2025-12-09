@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -46,6 +47,15 @@ import (
 type NamespaceQuotaReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+}
+
+type ClusterFree struct {
+	ClusterCPU int64
+	ClusterMem int64
+	ClusterGPU int64
+	MaxNodeCPU int64
+	MaxNodeMem int64
+	MaxNodeGPU int64
 }
 
 // RBAC
@@ -108,126 +118,86 @@ func (r *NamespaceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		"quotaDenied", quotaDenied)
 
 	// Determine target
-	target := int64(nsq.Spec.Behavior.QuotaScaling.TargetQuotaUtilization)
+	// target := int64(nsq.Spec.Behavior.QuotaScaling.TargetQuotaUtilization)
 
 	// Primary path: quota prevented pod creation -> try quota patch or node scale immediately
 	if quotaDenied {
 		logger.Info("Detected quota denial event — treating as immediate shortage")
 
-		// attempt to compute required step sizes from CR; if absent, fallback to sensible defaults
-		stepCPU, errCPU := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, corev1.ResourceCPU.String())
-		if errCPU != nil {
-			// fallback default: 500m
-			logger.Info("CPU scaleStep missing or invalid; using default 500m")
-			stepCPU = 500
-		}
+		free, _ := computeClusterFree(ctx, r.Client)
+		logger.Info("Cluster free resources", "CPU(m)", free.ClusterCPU, "Mem(bytes)", free.ClusterMem, "GPU(count)", free.ClusterGPU)
 
-		stepMem, errMem := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, corev1.ResourceMemory.String())
-		if errMem != nil {
-			logger.Info("Memory scaleStep missing or invalid; using default 512Mi")
-			stepMem = 512 * 1024 * 1024
-		}
-
-		stepGPU, _ := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, "nvidia.com/gpu")
-
-		// Free cluster capacity
-		freeCPU, freeMem, freeGPU, err := computeClusterFree(ctx, r.Client)
+		podsList, err := listPodsInNamespace(ctx, r.Client, rq.Namespace)
 		if err != nil {
-			logger.Error(err, "failed to compute cluster free resources")
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			logger.Error(err, "failed to list pods in namespace", "namespace", rq.Namespace)
+			return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
 		}
 
-		// safety margin (20%)
-		safetyCPU := stepCPU + (stepCPU / 5)
-		safetyMem := stepMem + (stepMem / 5)
-		safetyGPU := stepGPU + (stepGPU / 5)
-
-		if freeCPU >= safetyCPU || freeMem >= safetyMem || freeGPU >= safetyGPU {
-			logger.Info("Cluster has free resources, attempting quota patch (quotaDenied path)")
-
-			if err := r.patchQuota(ctx, &rq, stepCPU, stepMem, stepGPU, &nsq); err != nil {
-				logger.Error(err, "failed to patch quota")
-				return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
+		var podCPU, podMem, podGPU int64
+		for _, p := range podsList.Items {
+			for _, ctr := range append(p.Spec.InitContainers, p.Spec.Containers...) {
+				podCPU += ctr.Resources.Requests.Cpu().MilliValue()
+				podMem += ctr.Resources.Requests.Memory().Value()
+				if gpu, ok := ctr.Resources.Requests["nvidia.com/gpu"]; ok {
+					podGPU += gpu.Value()
+				}
 			}
+		}
 
-			logger.Info("Successfully patched ResourceQuota")
+		logger.Info("Total requested resources by pods in namespace",
+			"namespace", rq.Namespace,
+			"CPU(m)", podCPU,
+			"Mem(bytes)", podMem,
+			"GPU(count)", podGPU,
+		)
+
+		// Check if any single pod can be scheduled on the cluster
+
+		if podCPU <= free.MaxNodeCPU &&
+			podMem <= free.MaxNodeMem &&
+			podGPU <= free.MaxNodeGPU {
+			// schedulable
+			logger.Info("At least one pod in the namespace is schedulable on the cluster")
+		} else {
+			// not schedulable
+			logger.Info("No pod in the namespace is schedulable on the cluster - skipping quota patch")
 			return ctrl.Result{}, nil
 		}
 
-		// Otherwise → cluster scale-up
-		if nsq.Spec.Behavior.NodeScaling.Enabled {
-			logger.Info("Not enough free capacity - triggering node scale-up (quotaDenied path)")
-
-			if err := triggerScaleUpForCluster(nsq.Spec); err != nil {
-				logger.Error(err, "failed to trigger scale-up")
-				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-			}
-
-			logger.Info("Scale-up request sent")
-			return ctrl.Result{}, nil
-		}
-	}
-
-	// Secondary path: utilization-based proactive scaling
-	if int64(utilizationCPU) >= target || int64(utilizationMem) >= target {
-		logger.Info("Quota utilization above target — proactive scaling", "CPU (%)", utilizationCPU, "MEM (%)", utilizationMem)
-
-		// ScaleStep parsing from map[string]string
-		stepCPU, err := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, corev1.ResourceLimitsCPU.String())
-		if err != nil {
-			logger.Error(err, "missing CPU scaleStep quantity")
-			return ctrl.Result{}, nil
+	} else {
+		//  check if any pod,deployment,jobs,replicasets,statefulsets is pending due to quota or unschedulable due to resource shortage
+		logger.Info("No quota denial events detected; skipping immediate quota patch")
+		shortage, msg, _ := detectWorkloadShortage(ctx, r.Client, req.Namespace)
+		if shortage {
+			logger.Info("❌ Resource Shortage Detected → Scale Node or Patch Quota", "reason", msg)
+			// Trigger your quota patching / node autoscaling logic here
 		}
 
-		stepMem, err := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, corev1.ResourceLimitsMemory.String())
-		if err != nil {
-			logger.Error(err, "missing Memory scaleStep quantity")
-			return ctrl.Result{}, nil
-		}
+		return ctrl.Result{}, nil
 
-		// GPU optional
-		stepGPU, _ := parseScaledQuantity(nsq.Spec.Behavior.QuotaScaling.ScaleStep, "nvidia.com/gpu")
-
-		// Free cluster capacity
-		freeCPU, freeMem, freeGPU, err := computeClusterFree(ctx, r.Client)
-		if err != nil {
-			logger.Error(err, "failed to compute cluster free resources")
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-		}
-
-		// safety margin (20%)
-		safetyCPU := stepCPU + (stepCPU / 5)
-		safetyMem := stepMem + (stepMem / 5)
-		safetyGPU := stepGPU + (stepGPU / 5)
-
-		if freeCPU >= safetyCPU || freeMem >= safetyMem || freeGPU >= safetyGPU {
-			logger.Info("Cluster has free resources, attempting quota patch (utilization path)")
-
-			if err := r.patchQuota(ctx, &rq, stepCPU, stepMem, stepGPU, &nsq); err != nil {
-				logger.Error(err, "failed to patch quota")
-				return ctrl.Result{RequeueAfter: 20 * time.Second}, nil
-			}
-
-			logger.Info("Successfully patched ResourceQuota")
-			return ctrl.Result{}, nil
-		}
-
-		// Otherwise → cluster scale-up
-		if nsq.Spec.Behavior.NodeScaling.Enabled {
-			logger.Info("Not enough free capacity → triggering node scale-up (utilization path)")
-
-			if err := triggerScaleUpForCluster(nsq.Spec); err != nil {
-				logger.Error(err, "failed to trigger scale-up")
-				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-			}
-
-			logger.Info("Scale-up request sent")
-			return ctrl.Result{}, nil
-		}
 	}
 
 	// Nothing to do
 	return ctrl.Result{}, nil
+}
+
+func listPodsInNamespace(
+	ctx context.Context,
+	c client.Client,
+	namespace string,
+) (*corev1.PodList, error) {
+
+	logger := log.FromContext(ctx)
+	var podList corev1.PodList
+
+	if err := c.List(ctx, &podList,
+		client.InNamespace(namespace)); err != nil {
+
+		logger.Error(err, "failed to list Pods", "namespace", namespace)
+		return nil, err
+	}
+
+	return &podList, nil
 }
 
 func (r *NamespaceQuotaReconciler) patchQuota(
@@ -375,15 +345,13 @@ func postYAML(obj interface{}, url string) error {
 // It excludes control-plane / unschedulable nodes by:
 //   - skipping nodes with Spec.Unschedulable == true
 //   - skipping nodes that have taints typically used for control-plane/master (NoSchedule)
-func computeClusterFree(ctx context.Context, c client.Client) (int64, int64, int64, error) {
+func computeClusterFree(ctx context.Context, c client.Client) (*ClusterFree, error) {
 	var nodeList corev1.NodeList
 	if err := c.List(ctx, &nodeList); err != nil {
-		return 0, 0, 0, err
+		return nil, err
 	}
 
-	// helper to detect control-plane/master taints
 	isControlTaint := func(t corev1.Taint) bool {
-		// common control-plane taint keys; adapt if your cluster uses different keys
 		switch t.Key {
 		case "node-role.kubernetes.io/control-plane",
 			"node-role.kubernetes.io/master",
@@ -394,19 +362,16 @@ func computeClusterFree(ctx context.Context, c client.Client) (int64, int64, int
 		}
 	}
 
-	workerNodes := make(map[string]struct{})
-	var allocCPU, allocMem, allocGPU int64
-
+	workerNodes := map[string]corev1.Node{}
 	for _, n := range nodeList.Items {
-		// skip explicitly unschedulable nodes
 		if n.Spec.Unschedulable {
 			continue
 		}
-
-		// skip if any NoSchedule control-plane/master taint present
 		skip := false
 		for _, t := range n.Spec.Taints {
-			if isControlTaint(t) && (t.Effect == corev1.TaintEffectNoSchedule || t.Effect == corev1.TaintEffectPreferNoSchedule) {
+			if isControlTaint(t) &&
+				(t.Effect == corev1.TaintEffectNoSchedule ||
+					t.Effect == corev1.TaintEffectPreferNoSchedule) {
 				skip = true
 				break
 			}
@@ -414,96 +379,81 @@ func computeClusterFree(ctx context.Context, c client.Client) (int64, int64, int
 		if skip {
 			continue
 		}
-
-		// This node is considered a worker for our calculations
-		workerNodes[n.Name] = struct{}{}
-
-		if cpu := n.Status.Allocatable[corev1.ResourceCPU]; cpu.Value() > 0 {
-			allocCPU += cpu.MilliValue()
-		}
-		if mem := n.Status.Allocatable[corev1.ResourceMemory]; mem.Value() > 0 {
-			allocMem += mem.Value()
-		}
-		if gpu, exists := n.Status.Allocatable["nvidia.com/gpu"]; exists {
-			allocGPU += gpu.Value()
-		}
+		workerNodes[n.Name] = n
 	}
 
-	// List pods cluster-wide and sum only those scheduled on worker nodes
 	var podList corev1.PodList
 	if err := c.List(ctx, &podList); err != nil {
-		return 0, 0, 0, err
+		return nil, err
 	}
 
-	var usedCPU, usedMem, usedGPU int64
+	// prepare used resources per node
+	usedCPU := map[string]int64{}
+	usedMem := map[string]int64{}
+	usedGPU := map[string]int64{}
+
 	for _, p := range podList.Items {
-		// skip terminated pods
 		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
-
-		// skip pods not yet scheduled (they don't consume node allocatable)
 		if p.Spec.NodeName == "" {
 			continue
 		}
-
-		// only count pods that are scheduled onto considered worker nodes
 		if _, ok := workerNodes[p.Spec.NodeName]; !ok {
 			continue
 		}
-
-		// sum container requests
-		for _, ctr := range p.Spec.Containers {
-			if cpu, exists := ctr.Resources.Requests[corev1.ResourceCPU]; exists {
-				usedCPU += cpu.MilliValue()
-			}
-			if mem, exists := ctr.Resources.Requests[corev1.ResourceMemory]; exists {
-				usedMem += mem.Value()
-			}
-			if gpu, exists := ctr.Resources.Requests["nvidia.com/gpu"]; exists {
-				usedGPU += gpu.Value()
-			}
-		}
-		// include init containers too (they contribute to requests at runtime)
-		for _, ict := range p.Spec.InitContainers {
-			if cpu, exists := ict.Resources.Requests[corev1.ResourceCPU]; exists {
-				usedCPU += cpu.MilliValue()
-			}
-			if mem, exists := ict.Resources.Requests[corev1.ResourceMemory]; exists {
-				usedMem += mem.Value()
-			}
-			if gpu, exists := ict.Resources.Requests["nvidia.com/gpu"]; exists {
-				usedGPU += gpu.Value()
+		for _, ctr := range append(p.Spec.InitContainers, p.Spec.Containers...) {
+			usedCPU[p.Spec.NodeName] += ctr.Resources.Requests.Cpu().MilliValue()
+			usedMem[p.Spec.NodeName] += ctr.Resources.Requests.Memory().Value()
+			if gpu, ok := ctr.Resources.Requests["nvidia.com/gpu"]; ok {
+				usedGPU[p.Spec.NodeName] += gpu.Value()
 			}
 		}
 	}
 
-	freeCPU := allocCPU - usedCPU
-	freeMem := allocMem - usedMem
-	freeGPU := allocGPU - usedGPU
+	// compute cluster and per-node free
+	result := &ClusterFree{}
+	for name, node := range workerNodes {
+		allocCPU := node.Status.Allocatable.Cpu().MilliValue()
+		allocMem := node.Status.Allocatable.Memory().Value()
 
-	// Defensive: don't return negative free values
-	if freeCPU < 0 {
-		freeCPU = 0
-	}
-	if freeMem < 0 {
-		freeMem = 0
-	}
-	if freeGPU < 0 {
-		freeGPU = 0
+		var allocGPU int64
+		if g, ok := node.Status.Allocatable["nvidia.com/gpu"]; ok {
+			allocGPU = g.Value()
+		}
+
+		freeCPU := allocCPU - usedCPU[name]
+		freeMem := allocMem - usedMem[name]
+		freeGPU := allocGPU - usedGPU[name]
+
+		if freeCPU < 0 {
+			freeCPU = 0
+		}
+		if freeMem < 0 {
+			freeMem = 0
+		}
+		if freeGPU < 0 {
+			freeGPU = 0
+		}
+
+		// cluster totals
+		result.ClusterCPU += freeCPU
+		result.ClusterMem += freeMem
+		result.ClusterGPU += freeGPU
+
+		// schedulability limits (max free on a single node)
+		if freeCPU > result.MaxNodeCPU {
+			result.MaxNodeCPU = freeCPU
+		}
+		if freeMem > result.MaxNodeMem {
+			result.MaxNodeMem = freeMem
+		}
+		if freeGPU > result.MaxNodeGPU {
+			result.MaxNodeGPU = freeGPU
+		}
 	}
 
-	// debug log: which nodes we considered (optional)
-	// build a small slice to print
-	var nodes []string
-	for n := range workerNodes {
-		nodes = append(nodes, n)
-	}
-	fmt.Printf("Counted worker nodes: %v\n", nodes)
-	fmt.Printf("Cluster allocatable (workers only): CPU=%dm, Mem=%d bytes, GPU=%d\n", allocCPU, allocMem, allocGPU)
-	fmt.Printf("Cluster requested (workers only):   CPU=%dm, Mem=%d bytes, GPU=%d\n", usedCPU, usedMem, usedGPU)
-
-	return freeCPU, freeMem, freeGPU, nil
+	return result, nil
 }
 
 // Helpers to parse CR strings
@@ -664,6 +614,42 @@ func triggerScaleUpForCluster(spec scalingv1.NamespaceQuotaSpec) error {
 	return nil
 }
 
+func detectWorkloadShortage(ctx context.Context, c client.Client, ns string) (bool, string, error) {
+	var rsList appsv1.ReplicaSetList
+	if err := c.List(ctx, &rsList, client.InNamespace(ns)); err != nil {
+		return false, "", err
+	}
+
+	for _, rs := range rsList.Items {
+		desired := *rs.Spec.Replicas
+		ready := rs.Status.ReadyReplicas
+
+		if ready < desired {
+			// Check ReplicaFailure condition
+			for _, cond := range rs.Status.Conditions {
+				if cond.Type == appsv1.ReplicaSetReplicaFailure && cond.Status == corev1.ConditionTrue {
+					// Fetch recent events
+					events := corev1.EventList{}
+					_ = c.List(ctx, &events, client.InNamespace(ns))
+
+					for _, e := range events.Items {
+						if e.InvolvedObject.Kind == "ReplicaSet" &&
+							e.InvolvedObject.Name == rs.Name &&
+							e.Type == corev1.EventTypeWarning &&
+							(strings.Contains(e.Message, "exceeded quota") ||
+								strings.Contains(e.Message, "Insufficient") ||
+								strings.Contains(e.Message, "nodes are available")) {
+
+							return true, e.Message, nil // 🚨 shortage detected!
+						}
+					}
+				}
+			}
+		}
+	}
+	return false, "", nil
+}
+
 // map Deployment changes to NamespaceQuota CRs that reference a ResourceQuota
 func (r *NamespaceQuotaReconciler) watchDeploymentToNamespaceQuotas(obj client.Object) []reconcile.Request {
 	dep := obj.(*appsv1.Deployment)
@@ -717,12 +703,16 @@ func (r *NamespaceQuotaReconciler) watchResourceQuotaToNamespaceQuotas(ctx conte
 	return out
 }
 
-func (r *NamespaceQuotaReconciler) watchEventToNamespaceQuotas(obj client.Object) []reconcile.Request {
+func (r *NamespaceQuotaReconciler) watchEventsCluster(ctx context.Context, obj client.Object) []reconcile.Request {
+	// logger := log.FromContext(ctx)
+	// logger.Info("ReplicaSet event detected, checking for affected NamespaceQuota resources")
+	logger := log.FromContext(ctx)
+
 	ev := obj.(*corev1.Event)
 	if ev.Type != corev1.EventTypeWarning {
 		return nil
 	}
-	if ev.Reason != "FailedCreate" && !strings.Contains(strings.ToLower(ev.Message), "exceeded quota") {
+	if ev.Reason != "FailedCreate" && !strings.Contains(strings.ToLower(ev.Message), "exceeded quota") && !strings.Contains(strings.ToLower(ev.Message), "insufficient") && !strings.Contains(strings.ToLower(ev.Message), "nodes are available") {
 		return nil
 	}
 
@@ -738,8 +728,34 @@ func (r *NamespaceQuotaReconciler) watchEventToNamespaceQuotas(obj client.Object
 			out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsq.Namespace, Name: nsq.Name}})
 		}
 	}
+
+	if strings.Contains(strings.ToLower(ev.Message), "exceeded quota") {
+		logger.Info("Quota exceeded event detected", "eventNamespace", ev.InvolvedObject.Namespace, "namespaceQuotaObject", "eventMessage", ev.Message)
+	} else {
+		logger.Info("Resource outtage", "eventNamespace", ev.InvolvedObject.Namespace, "eventMessage", ev.Message)
+	}
+
+	// logger.Info("Event detected, enqueueing NamespaceQuota resources", "count", len(out), "eventNamespace", ev.InvolvedObject.Namespace, "eventMessage", ev.Message)
 	return out
 }
+
+// this will watch the number of nodes in the cluster, will retrigger reconciliation of all NamespaceQuota resources that reference ResourceQuotas in any namespace
+func (r *NamespaceQuotaReconciler) watchNodesCluster(ctx context.Context, obj client.Object) []reconcile.Request {
+	// Map ResourceQuota changes to NamespaceQuota CRs in the same namespace that reference it
+	rq := obj.(*corev1.ResourceQuota)
+	var out []reconcile.Request
+	var list scalingv1.NamespaceQuotaList
+	if err := r.List(context.Background(), &list, client.InNamespace(rq.Namespace)); err != nil {
+		return nil
+	}
+	for _, nsq := range list.Items {
+		if nsq.Spec.AppliedQuotaRef.Name == rq.Name && nsq.Spec.AppliedQuotaRef.Namespace == rq.Namespace {
+			out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: nsq.Namespace, Name: nsq.Name}})
+		}
+	}
+	return out
+}
+
 func (r *NamespaceQuotaReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(
@@ -747,5 +763,11 @@ func (r *NamespaceQuotaReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1.ResourceQuota{},
 			handler.EnqueueRequestsFromMapFunc(
 				r.watchResourceQuotaToNamespaceQuotas)).
+		Watches(&corev1.Event{},
+			handler.EnqueueRequestsFromMapFunc(
+				r.watchEventsCluster)).
+		Watches(&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(
+				r.watchNodesCluster)).
 		Named("namespacequota").Complete(r)
 }

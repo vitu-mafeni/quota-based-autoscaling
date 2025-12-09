@@ -1,28 +1,26 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: stress-ng
+  name: quota-burst
   namespace: quota-test
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
-      app: stress-ng
+      app: quota-burst
   template:
     metadata:
       labels:
-        app: stress-ng
+        app: quota-burst
     spec:
-      nodeName: ip-192-168-0-235
       containers:
       - name: stress
-        image: polinux/stress
-        args: ["--cpu", "4"]
+        image: nginx
+        # args: ["--cpu", "1"]
         resources:
           requests:
-            cpu: "10000m"      # 10 cores request
-            memory: "32Gi"     # 32Gi request
+            cpu: "700m"
+            memory: "1Gi"
           limits:
-            cpu: "10000m"      # same as request
-            memory: "32Gi"
-# controller logic is based on ResourceQuota violation, NOT top usage.
+            cpu: "700m"
+            memory: "1Gi"
