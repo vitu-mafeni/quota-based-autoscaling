@@ -782,7 +782,7 @@ func (r *NamespaceQuotaReconciler) watchEventsCluster(ctx context.Context, obj c
 	}
 
 	if strings.Contains(strings.ToLower(ev.Message), "exceeded quota") {
-		logger.Info("Quota exceeded event detected", "eventNamespace", ev.InvolvedObject.Namespace, "namespaceQuotaObject", "eventMessage", ev.Message)
+		logger.Info("quota exceeded", "eventNamespace", ev.InvolvedObject.Namespace, "eventMessage", ev.Message)
 	} else {
 		logger.Info("Resource outtage", "eventNamespace", ev.InvolvedObject.Namespace, "eventMessage", ev.Message)
 		err := r.TriggerScaleUpForCluster(ev.InvolvedObject.Namespace)

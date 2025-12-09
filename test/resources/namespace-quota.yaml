@@ -8,14 +8,16 @@ kind: ResourceQuota
 metadata:
   name: test-quota-small
   namespace: quota-test
-spec:
-  hard:
-    limits.cpu: "10000m"      # 10 cores only
-    limits.memory: "40Gi"     # 4 GiB only
-
+  
+# this will detect resource shortage and trigger node scaling
 # spec:
 #   hard:
-#     limits.cpu: "2000m"      # 2 cores only
-#     limits.memory: "4Gi"     # 4 GiB only
+#     limits.cpu: "10000m"      # 10 cores only
+#     limits.memory: "40Gi"     # 4 GiB only
+
+spec:
+  hard:
+    limits.cpu: "1000m"      # 2 cores only
+    limits.memory: "4Gi"     # 4 GiB only
 
 # this will detect quota shortage and trigger scaling

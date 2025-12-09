@@ -19,10 +19,10 @@ spec:
         # for testing Quota scaling
         resources:
           requests:
-            cpu: "100m"
+            cpu: "500m"
             memory: "1Gi"
           limits:
-            cpu: "100m"
+            cpu: "500m"
             memory: "1Gi"
         # For testing Node scaling for t3.large which has 2 vCPU and 8 GiB memory
         # resources:
