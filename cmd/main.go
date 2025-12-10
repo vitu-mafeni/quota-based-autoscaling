@@ -19,6 +19,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"log"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -37,6 +38,7 @@ import (
 
 	scalingv1 "github.com/vitumafeni/quota-based-scaling/api/v1"
 	"github.com/vitumafeni/quota-based-scaling/internal/controller"
+	"github.com/vitumafeni/quota-based-scaling/restapi"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -173,6 +175,15 @@ func main() {
 		// after the manager stops then its usage might be unsafe.
 		// LeaderElectionReleaseOnCancel: true,
 	})
+
+	serverType := os.Getenv("SERVER_TYPE")
+	if serverType != "" && serverType == "MGMT" {
+		// Start NameSpaceQuota server & node fault monitoring
+		restApiAddrPort := ":8000" // can also read from ENV
+		restapi.StartServer(mgr.GetClient(), restApiAddrPort)
+		log.Printf("QuotaBasedScalingServer  server and listening started on %s", restApiAddrPort)
+	}
+
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
