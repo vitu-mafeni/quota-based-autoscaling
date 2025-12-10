@@ -12,7 +12,9 @@ import (
 
 	// "github.com/vitu1234/quota-based-scaling/internal/controller"
 
+	"github.com/nephio-project/nephio/controllers/pkg/resource"
 	scalingv1 "github.com/vitumafeni/quota-based-scaling/api/v1"
+	git "github.com/vitumafeni/quota-based-scaling/reconcilers/git"
 	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -99,7 +101,7 @@ func (s *HeartbeatStore) All() []HeartbeatPayload {
 // var NodeTimeout = getenvDuration("HEARTBEAT_FAULT_DELAY", 20*time.Second)
 
 // RunQuotaBasedScalingServer starts HTTP server inside your controller
-func RunQuotaBasedScalingServer(store *HeartbeatStore, addr string, k8sClient ctrl.Client) {
+func RunQuotaBasedScalingServer(store *HeartbeatStore, addr string, Mgmtk8sClient ctrl.Client) {
 	mux := http.NewServeMux()
 	log := logf.FromContext(context.Background())
 
@@ -137,11 +139,11 @@ func RunQuotaBasedScalingServer(store *HeartbeatStore, addr string, k8sClient ct
 
 		case *corev1.ResourceQuota:
 			fmt.Printf("Parsed ResourceQuota: %s/%s\n", o.Namespace, o.Name)
-			handleRQFromCluster(k8sClient, *o)
+			handleRQFromCluster(Mgmtk8sClient, *o)
 
 		case *scalingv1.NamespaceQuota:
 			fmt.Printf("Parsed NamespaceQuota: %s/%s\n", o.Namespace, o.Name)
-			handleNamespaceQuota(k8sClient, *o)
+			handleNamespaceQuota(Mgmtk8sClient, *o)
 
 		default:
 			fmt.Printf("Unknown object type: %T\n", o)
@@ -168,7 +170,7 @@ func RunQuotaBasedScalingServer(store *HeartbeatStore, addr string, k8sClient ct
 }
 
 // handle ResourceQuota from workload cluster, create or update NamespaceQuota CR
-func handleRQFromCluster(k8sClient ctrl.Client, rq corev1.ResourceQuota) {
+func handleRQFromCluster(Mgmtk8sClient ctrl.Client, rq corev1.ResourceQuota) {
 	ctx := context.Background()
 	log := logf.FromContext(ctx)
 
@@ -179,7 +181,7 @@ func handleRQFromCluster(k8sClient ctrl.Client, rq corev1.ResourceQuota) {
 
 	// create namespace if not exists
 	ns := &corev1.Namespace{}
-	err := k8sClient.Get(ctx, ctrl.ObjectKey{Name: nqNamespace}, ns)
+	err := Mgmtk8sClient.Get(ctx, ctrl.ObjectKey{Name: nqNamespace}, ns)
 	if err != nil {
 		// create new namespace
 		ns = &corev1.Namespace{
@@ -191,7 +193,7 @@ func handleRQFromCluster(k8sClient ctrl.Client, rq corev1.ResourceQuota) {
 				Name: nqNamespace,
 			},
 		}
-		if err := k8sClient.Create(ctx, ns); err != nil {
+		if err := Mgmtk8sClient.Create(ctx, ns); err != nil {
 			log.Error(err, "failed to create Namespace", "name", nqNamespace)
 			return
 		}
@@ -199,7 +201,7 @@ func handleRQFromCluster(k8sClient ctrl.Client, rq corev1.ResourceQuota) {
 	}
 
 	nq := &corev1.ResourceQuota{}
-	err = k8sClient.Get(ctx, ctrl.ObjectKey{Namespace: nqNamespace, Name: nqName}, nq)
+	err = Mgmtk8sClient.Get(ctx, ctrl.ObjectKey{Namespace: nqNamespace, Name: nqName}, nq)
 	if err != nil {
 		// create new
 		nq = &corev1.ResourceQuota{
@@ -215,7 +217,7 @@ func handleRQFromCluster(k8sClient ctrl.Client, rq corev1.ResourceQuota) {
 				Hard: rq.Spec.Hard,
 			},
 		}
-		if err := k8sClient.Create(ctx, nq); err != nil {
+		if err := Mgmtk8sClient.Create(ctx, nq); err != nil {
 			log.Error(err, "failed to create ResourceQuota", "name", nqName)
 			return
 		}
@@ -225,23 +227,35 @@ func handleRQFromCluster(k8sClient ctrl.Client, rq corev1.ResourceQuota) {
 
 	// update existing
 	nq.Spec.Hard = rq.Spec.Hard
-	if err := k8sClient.Update(ctx, nq); err != nil {
+	if err := Mgmtk8sClient.Update(ctx, nq); err != nil {
 		log.Error(err, "failed to update ResourceQuota from workload cluster", "name", nqName)
 		return
 	}
 	log.Info("Updated ResourceQuota from ResourceQuota from workload cluster", "name", nqName)
 }
 
-func handleNamespaceQuota(k8sClient ctrl.Client, nqCR scalingv1.NamespaceQuota) {
+func handleNamespaceQuota(Mgmtk8sClient ctrl.Client, nqCR scalingv1.NamespaceQuota) {
 	ctx := context.Background()
 	log := logf.FromContext(ctx)
 
 	nqName := nqCR.Name // assuming same name
 	nqNamespace := nqCR.Namespace
 
+	// //initialize workload cluster client
+	// _, workloadClusterClient, _, err := capi.GetWorkloadClusterClient(ctx, Mgmtk8sClient, nqCR.Spec.ClusterRef.Name)
+	// if err != nil {
+	// 	log.Error(err, "Failed to get workload cluster client", "clusterName", nqCR.Spec.ClusterRef.Name)
+	// 	return
+	// }
+	// if workloadClusterClient == nil {
+	// 	// Cluster not ready or being deleted; just requeue
+	// 	log.Info("Cluster client not available yet", "clusterName", nqCR.Spec.ClusterRef.Name)
+	// 	return
+	// }
+
 	// create namespace if not exists
 	ns := &corev1.Namespace{}
-	err := k8sClient.Get(ctx, ctrl.ObjectKey{Name: nqNamespace}, ns)
+	err := Mgmtk8sClient.Get(ctx, ctrl.ObjectKey{Name: nqNamespace}, ns)
 	if err != nil {
 		// create new namespace
 		ns = &corev1.Namespace{
@@ -253,7 +267,7 @@ func handleNamespaceQuota(k8sClient ctrl.Client, nqCR scalingv1.NamespaceQuota) 
 				Name: nqNamespace,
 			},
 		}
-		if err := k8sClient.Create(ctx, ns); err != nil {
+		if err := Mgmtk8sClient.Create(ctx, ns); err != nil {
 			log.Error(err, "failed to create Namespace", "name", nqNamespace)
 			return
 		}
@@ -261,7 +275,7 @@ func handleNamespaceQuota(k8sClient ctrl.Client, nqCR scalingv1.NamespaceQuota) 
 	}
 
 	nq := &scalingv1.NamespaceQuota{}
-	err = k8sClient.Get(ctx, ctrl.ObjectKey{Namespace: nqNamespace, Name: nqName}, nq)
+	err = Mgmtk8sClient.Get(ctx, ctrl.ObjectKey{Namespace: nqNamespace, Name: nqName}, nq)
 	if err != nil {
 		// create new
 		nq = &scalingv1.NamespaceQuota{
@@ -278,22 +292,64 @@ func handleNamespaceQuota(k8sClient ctrl.Client, nqCR scalingv1.NamespaceQuota) 
 				Behavior:   nq.Spec.Behavior,
 			},
 		}
-		if err := k8sClient.Create(ctx, nq); err != nil {
+		if err := Mgmtk8sClient.Create(ctx, nq); err != nil {
 			log.Error(err, "failed to create NamespaceQuota CR from workload cluster", "name", nqName)
 			return
 		}
 		log.Info("Created NamespaceQuota from NamespaceQuota from workload cluster", "name", nqName)
-		return
+		// return
 	}
 
 	// update existing
 	nq.Spec.ClusterRef = nqCR.Spec.ClusterRef
 	nq.Spec.Behavior = nqCR.Spec.Behavior
-	if err := k8sClient.Update(ctx, nq); err != nil {
+	if err := Mgmtk8sClient.Update(ctx, nq); err != nil {
 		log.Error(err, "failed to update NamespaceQuota CR from workload cluster", "name", nqName)
 		return
 	}
-	log.Info("Updated NamespaceQuota from NamespaceQuota from workload cluster", "name", nqName)
+
+	username, _, _, err := git.GetGiteaSecretUserNamePassword(ctx, Mgmtk8sClient)
+	if err != nil {
+		log.Error(err, "Failed to get Gitea credentials")
+		return
+	}
+
+	// Wrap the controller-runtime client into a resource.APIPatchingApplicator
+	applier := resource.NewAPIPatchingApplicator(Mgmtk8sClient)
+
+	giteaClient, err := git.GetClient(ctx, applier)
+	if err != nil {
+		log.Error(err, "Failed to initialize Gitea client")
+		return
+	}
+
+	if !giteaClient.IsInitialized() {
+		log.Info("Gitea client not yet initialized, retrying later")
+		return
+	}
+
+	// user, resp, err := giteaClient.GetMyUserInfo()
+	// if err != nil {
+	// 	log.Error(err, "Failed to get Gitea user info", "response", resp)
+	// 	return
+	// }
+
+	// start with managment cluster repo to find matching manifests
+	_, matchesMgmt, err := git.CheckRepoForMatchingNamespaceQuotaManifests(ctx, nqCR.Spec.ClusterRef.RepositoryURL, "main", &nqCR)
+	if err != nil {
+		_, err = CreateAndPushNamespaceQuotaCR(ctx, giteaClient.Get(), username, nqCR.Spec.ClusterRef.Name, nqCR.Spec.ClusterRef.Path, &nqCR)
+		log.Error(err, "Failed to find matching manifests in source repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+		return
+	}
+
+	if len(matchesMgmt) == 0 {
+		log.Info("No matching manifests found, pushing a new one to mgmt repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+
+		return
+	}
+
+	log.Info("Found matching manifests", "count", len(matchesMgmt), "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+	log.Info("Updated NamespaceQuota from NamespaceQuota from workload cluster, pushed to git success", "name", nqName)
 }
 
 func getenvDuration(key string, defaultVal time.Duration) time.Duration {
@@ -361,7 +417,7 @@ func UpsertNodeHealth(ctx context.Context, c ctrl.Client, namespace string, hb H
 /*
 func MonitorNodes(
 	store *HeartbeatStore,
-	k8sClient ctrl.Client,
+	Mgmtk8sClient ctrl.Client,
 	namespace string,
 	clusterPolicyReconciler *controller.ClusterPolicyReconciler,
 ) {
@@ -443,7 +499,7 @@ func MonitorNodes(
 						nodeName := hb.NodeName
 						// get all machines and find the one with matching node name
 						var machineList capiv1beta1.MachineList
-						err := k8sClient.List(ctx, &machineList, client.InNamespace(namespace))
+						err := Mgmtk8sClient.List(ctx, &machineList, client.InNamespace(namespace))
 						if err != nil {
 							log.Error(err, "failed to list CAPI machines")
 							return
@@ -470,7 +526,7 @@ func MonitorNodes(
 							}
 						}
 
-						err = k8sClient.Get(ctx, types.NamespacedName{
+						err = Mgmtk8sClient.Get(ctx, types.NamespacedName{
 							Namespace: namespace,
 							Name:      machineName,
 						}, machine)
@@ -478,7 +534,7 @@ func MonitorNodes(
 							log.Error(err, "could not get CAPI machine with the name "+hb.NodeName)
 						}
 					} else {
-						err := k8sClient.Get(ctx, types.NamespacedName{
+						err := Mgmtk8sClient.Get(ctx, types.NamespacedName{
 							Namespace: namespace,
 							Name:      hb.NodeName,
 						}, machine)
@@ -502,7 +558,7 @@ func MonitorNodes(
 					}
 
 					if err := UpsertNodeHealth(
-						context.Background(), k8sClient, namespace, hb, "Unhealthy",
+						context.Background(), Mgmtk8sClient, namespace, hb, "Unhealthy",
 					); err != nil {
 						log.Error(err, "failed to update NodeHealth",
 							"nodeName", hb.NodeName,
@@ -518,7 +574,7 @@ func MonitorNodes(
 */
 
 // StartServer starts heartbeat server and fault monitoring
-func StartServer(k8sClient ctrl.Client, addr string) {
+func StartServer(Mgmtk8sClient ctrl.Client, addr string) {
 	cfg := zap.Options{
 		TimeEncoder: zapcore.TimeEncoderOfLayout("2006-01-02T15:04:05.000Z07:00"), // Milliseconds
 	}
@@ -526,6 +582,6 @@ func StartServer(k8sClient ctrl.Client, addr string) {
 	logf.SetLogger(zapLog)
 
 	store := NewHeartbeatStore()
-	RunQuotaBasedScalingServer(store, addr, k8sClient)
-	// go MonitorNodes(store, k8sClient, namespace, clusterPolicyReconciler)
+	RunQuotaBasedScalingServer(store, addr, Mgmtk8sClient)
+	// go MonitorNodes(store, Mgmtk8sClient, namespace, clusterPolicyReconciler)
 }

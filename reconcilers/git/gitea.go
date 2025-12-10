@@ -44,7 +44,7 @@ type MatchingNadFiles struct {
 // CheckRepoForMatchingManifests clones a repo and searches YAML files for a name/namespace match.
 // CheckRepoForMatchingManifests clones a Git repo and scans it for YAML manifests
 // matching a given ResourceRef. Uses concurrent workers for faster scanning.
-func CheckRepoForMatchingManifests(
+func CheckRepoForMatchingNamespaceQuotaManifests(
 	ctx context.Context,
 	repoURL string,
 	branch string,
@@ -55,7 +55,7 @@ func CheckRepoForMatchingManifests(
 	log.Info("Cloning repo", "url", repoURL, "branch", branch)
 
 	// Create temp directory
-	tmpDir, err := os.MkdirTemp("", "transition-manifests-*")
+	tmpDir, err := os.MkdirTemp("", "quota-based-manifests-*")
 	if err != nil {
 		return "", nil, err
 	}
@@ -191,114 +191,6 @@ func CheckRepoForMatchingManifests(
 			return tmpDir, matchingFiles, nil
 		}
 	}
-}
-
-// FindMatchingNADs walks a directory tree and returns all files containing
-// NetworkAttachmentDefinition objects that match any of the provided nfconfigInterfaces.
-
-func UpdateInterfaceIPsNFDeployment(path string, newIPs map[string]IPInfo) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-
-	var doc map[string]interface{}
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return err
-	}
-
-	spec, ok := doc["spec"].(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	ifaces, ok := spec["interfaces"].([]interface{})
-	if !ok {
-		return nil
-	}
-
-	for _, iface := range ifaces {
-		m := iface.(map[string]interface{})
-		name := m["name"].(string)
-		if info, ok := newIPs[name]; ok {
-			if ipv4, ok := m["ipv4"].(map[string]interface{}); ok {
-				if info.Address != "" {
-					ipv4["address"] = info.Address
-				}
-				if info.Gateway != "" {
-					ipv4["gateway"] = info.Gateway
-				}
-			}
-		}
-	}
-
-	out, err := yaml.Marshal(doc)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, out, 0644)
-}
-
-// UpdateInterfaceIPsConfigRefs updates the IP addresses and gateways
-// in a manifest of kind Config that contains nested NFDeployment spec.
-func UpdateInterfaceIPsConfigRefs(path string, newIPs map[string]IPInfo) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-
-	var doc map[string]interface{}
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		return err
-	}
-
-	// Drill down to spec.config.spec.interfaces
-	spec, ok := doc["spec"].(map[string]interface{})
-	if !ok {
-		return nil
-	}
-
-	config, ok := spec["config"].(map[string]interface{})
-	if !ok {
-		return nil
-	}
-
-	nfSpec, ok := config["spec"].(map[string]interface{})
-	if !ok {
-		return nil
-	}
-
-	ifaces, ok := nfSpec["interfaces"].([]interface{})
-	if !ok {
-		return nil
-	}
-
-	for _, iface := range ifaces {
-		ifaceMap, ok := iface.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		name, ok := ifaceMap["name"].(string)
-		if !ok {
-			continue
-		}
-		if info, ok := newIPs[name]; ok {
-			if ipv4, ok := ifaceMap["ipv4"].(map[string]interface{}); ok {
-				if info.Address != "" {
-					ipv4["address"] = info.Address
-				}
-				if info.Gateway != "" {
-					ipv4["gateway"] = info.Gateway
-				}
-			}
-		}
-	}
-
-	out, err := yaml.Marshal(doc)
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(path, out, 0644)
 }
 
 // UpdateResourceContainers updates matching container images

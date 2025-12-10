@@ -1,0 +1,47 @@
+apiVersion: scaling.dcn.ssu.ac.kr/v1
+kind: NamespaceQuota
+metadata:
+  labels:
+    app.kubernetes.io/name: quota-based-autoscaling
+    app.kubernetes.io/managed-by: kustomize
+  name: namespacequota-sample
+  namespace: quota-test
+spec:
+  clusterRef:
+    name: sample-cluster
+    repositoryUrl: http://13.214.152.150:31637/nephio/mgmt.git
+    path: "samples-scaling"
+    endpointServer: http://13.214.152.150:8000
+
+  # The ResourceQuota in the namespace that this controller/webhook manages
+  appliedQuotaRef:
+    namespace: quota-test
+    name: test-quota-small
+
+  behavior:
+  # Quota Scaling Logic — Increase quota first if cluster has free capacity
+    quotaScaling:
+      enabled: true
+      minQuota:                  # Lower bound for auto-patching quotas
+        cpu: "500m"
+        memory: "512Mi"
+        # nvidia.com/gpu: "0"
+      maxQuota:                   # Upper bound controller will not exceed
+        cpu: "4000m"
+        memory: "4Gi"
+        # nvidia.com/gpu: "4"
+      scaleStep:                  # Increment step for scaling quotas
+        cpu: "500m"
+        memory: "512Mi"
+        # nvidia.com/gpu: "1"
+      targetQuotaUtilization: 70 # Trigger quota increase when usage > 70%
+
+
+    # Node Scaling Logic — If cluster has no free capacity
+    nodeScaling:
+      enabled: true
+      minNodes: 1
+      maxNodes: 5
+      nodeFlavor: standard-medium
+      scaleUpCooldownSeconds: 85   # Prevent rapid, repeated node scaling
+      scaleUpThreshold: 50          # Trigger node scale-up when allocatable usage > 50%

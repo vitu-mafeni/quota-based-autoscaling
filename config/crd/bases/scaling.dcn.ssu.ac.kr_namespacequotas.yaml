@@ -96,7 +96,14 @@ spec:
                 properties:
                   endpointServer:
                     type: string
+                  managementCluster:
+                    properties:
+                      repositoryUrl:
+                        type: string
+                    type: object
                   name:
+                    type: string
+                  path:
                     type: string
                   repositoryUrl:
                     type: string
