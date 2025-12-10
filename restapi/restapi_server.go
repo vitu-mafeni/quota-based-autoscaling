@@ -337,12 +337,16 @@ func handleNamespaceQuota(Mgmtk8sClient ctrl.Client, nqCR scalingv1.NamespaceQuo
 	// start with managment cluster repo to find matching manifests
 	_, matchesMgmt, err := git.CheckRepoForMatchingNamespaceQuotaManifests(ctx, nqCR.Spec.ClusterRef.RepositoryURL, "main", &nqCR)
 	if err != nil {
-		_, err = CreateAndPushNamespaceQuotaCR(ctx, giteaClient.Get(), username, nqCR.Spec.ClusterRef.Name, nqCR.Spec.ClusterRef.Path, &nqCR)
+
 		log.Error(err, "Failed to find matching manifests in source repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
 		return
 	}
 
 	if len(matchesMgmt) == 0 {
+		_, err = CreateAndPushNamespaceQuotaCR(ctx, giteaClient.Get(), username, nqCR.Spec.ClusterRef.Name, nqCR.Spec.ClusterRef.Path, &nqCR)
+		if err != nil {
+			log.Error(err, "Failed to push NamespaceQuota CR to management repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+		}
 		log.Info("No matching manifests found, pushing a new one to mgmt repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
 
 		return

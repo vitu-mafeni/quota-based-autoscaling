@@ -33,6 +33,8 @@ func CreateAndPushNamespaceQuotaCR(
 ) (string, error) {
 	log := logr.FromContextOrDiscard(ctx)
 
+	log.Info("Pushing NamespaceQuota Resource to Gitea", "repo", repoName, "folder", folder)
+
 	yamlData, err := yaml.Marshal(namespacequota)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal NamespaceQuota YAML: %w", err)
