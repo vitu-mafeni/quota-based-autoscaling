@@ -115,7 +115,7 @@ type NamespaceQuota struct {
 
 	// metadata is a standard object metadata
 	// +optional
-	metav1.ObjectMeta `json:"metadata,omitempty,omitzero"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	// spec defines the desired state of NamespaceQuota
 	// +required
@@ -123,7 +123,7 @@ type NamespaceQuota struct {
 
 	// status defines the observed state of NamespaceQuota
 	// +optional
-	Status NamespaceQuotaStatus `json:"status,omitempty,omitzero"`
+	Status NamespaceQuotaStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true

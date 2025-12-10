@@ -241,17 +241,14 @@ func handleNamespaceQuota(Mgmtk8sClient ctrl.Client, nqCR scalingv1.NamespaceQuo
 	nqName := nqCR.Name // assuming same name
 	nqNamespace := nqCR.Namespace
 
-	// //initialize workload cluster client
-	// _, workloadClusterClient, _, err := capi.GetWorkloadClusterClient(ctx, Mgmtk8sClient, nqCR.Spec.ClusterRef.Name)
-	// if err != nil {
-	// 	log.Error(err, "Failed to get workload cluster client", "clusterName", nqCR.Spec.ClusterRef.Name)
-	// 	return
-	// }
-	// if workloadClusterClient == nil {
-	// 	// Cluster not ready or being deleted; just requeue
-	// 	log.Info("Cluster client not available yet", "clusterName", nqCR.Spec.ClusterRef.Name)
-	// 	return
-	// }
+	nsQuotaObject := &scalingv1.NamespaceQuota{}
+	nsQuotaObject.TypeMeta = metav1.TypeMeta{
+		Kind:       "NamespaceQuota",
+		APIVersion: "scaling.dcn.ssu.ac.kr/v1",
+	}
+	nsQuotaObject.ObjectMeta = nqCR.ObjectMeta
+	nsQuotaObject.Spec = nqCR.Spec
+	nsQuotaObject.Status = nqCR.Status
 
 	// create namespace if not exists
 	ns := &corev1.Namespace{}
@@ -335,7 +332,7 @@ func handleNamespaceQuota(Mgmtk8sClient ctrl.Client, nqCR scalingv1.NamespaceQuo
 	// }
 
 	// start with managment cluster repo to find matching manifests
-	_, matchesMgmt, err := git.CheckRepoForMatchingNamespaceQuotaManifests(ctx, nqCR.Spec.ClusterRef.RepositoryURL, "main", &nqCR)
+	_, matchesMgmt, err := git.CheckRepoForMatchingNamespaceQuotaManifests(ctx, nqCR.Spec.ClusterRef.RepositoryURL, "main", nsQuotaObject)
 	if err != nil {
 
 		log.Error(err, "Failed to find matching manifests in source repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
@@ -343,11 +340,12 @@ func handleNamespaceQuota(Mgmtk8sClient ctrl.Client, nqCR scalingv1.NamespaceQuo
 	}
 
 	if len(matchesMgmt) == 0 {
-		_, err = CreateAndPushNamespaceQuotaCR(ctx, giteaClient.Get(), username, nqCR.Spec.ClusterRef.Name, nqCR.Spec.ClusterRef.Path, &nqCR)
+		log.Info("No matching manifests found, pushing a new one to mgmt repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+		_, err = CreateAndPushNamespaceQuotaCR(ctx, giteaClient.Get(), username, nqCR.Spec.ClusterRef.Name, nqCR.Spec.ClusterRef.Path, nsQuotaObject)
 		if err != nil {
 			log.Error(err, "Failed to push NamespaceQuota CR to management repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
 		}
-		log.Info("No matching manifests found, pushing a new one to mgmt repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+		log.Info("created and push a new NamespaceQuota CR", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
 
 		return
 	}

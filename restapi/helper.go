@@ -9,7 +9,7 @@ import (
 	gitea "code.gitea.io/sdk/gitea"
 	"github.com/go-logr/logr"
 	scalingv1 "github.com/vitumafeni/quota-based-scaling/api/v1"
-	"gopkg.in/yaml.v2"
+	"sigs.k8s.io/yaml"
 )
 
 type ArgoAppSkipResourcesIgnoreDifferences struct {
