@@ -257,7 +257,7 @@ func handleNamespaceQuota(k8sClient ctrl.Client, nqCR scalingv1.NamespaceQuota) 
 			log.Error(err, "failed to create Namespace", "name", nqNamespace)
 			return
 		}
-		log.Info("Created Namespace for ResourceQuota from workload cluster", "name", nqNamespace)
+		log.Info("Created Namespace for NamespaceQuota from workload cluster", "name", nqNamespace)
 	}
 
 	nq := &scalingv1.NamespaceQuota{}
