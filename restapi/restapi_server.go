@@ -14,13 +14,28 @@ import (
 
 	scalingv1 "github.com/vitumafeni/quota-based-scaling/api/v1"
 	"go.uber.org/zap/zapcore"
-	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	ctrl "sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
+
+// Global scheme for REST API server
+var apiScheme = runtime.NewScheme()
+
+func init() {
+	_ = corev1.AddToScheme(apiScheme)
+	_ = scalingv1.AddToScheme(apiScheme)
+	metav1.AddToGroupVersion(apiScheme, schema.GroupVersion{Group: "", Version: "v1"})
+}
+func yamlDecode(body []byte) (runtime.Object, *schema.GroupVersionKind, error) {
+	decoder := serializer.NewCodecFactory(apiScheme).UniversalDeserializer()
+	return decoder.Decode(body, nil, nil)
+}
 
 // Payload sent by agents
 type HeartbeatPayload struct {
@@ -102,37 +117,34 @@ func RunQuotaBasedScalingServer(store *HeartbeatStore, addr string, k8sClient ct
 			return
 		}
 
-		// Detect Kind and APIVersion
-		typeMeta := metav1.TypeMeta{}
-		if err := yaml.Unmarshal(body, &typeMeta); err != nil {
-			http.Error(w, "invalid yaml: cannot parse type", http.StatusBadRequest)
+		fmt.Println("RAW BODY:")
+		fmt.Println(string(body))
+
+		// Universal Kubernetes decoder
+		obj, gvk, err := yamlDecode(body)
+		if err != nil {
+			fmt.Printf("Decode error: %v\n", err)
+			http.Error(w, "cannot decode", http.StatusBadRequest)
 			return
 		}
 
-		fmt.Printf("Received object: apiVersion=%s, kind=%s\n", typeMeta.APIVersion, typeMeta.Kind)
+		fmt.Printf("Received: %s / %s\n", gvk.Group, gvk.Kind)
 
-		// Decode based on Kind
-		switch typeMeta.Kind {
-		case "ResourceQuota":
-			var rq corev1.ResourceQuota
-			if err := yaml.Unmarshal(body, &rq); err != nil {
-				http.Error(w, "cannot parse ResourceQuota", http.StatusBadRequest)
-				return
-			}
-			fmt.Printf("Parsed ResourceQuota: %s/%s\n", rq.Namespace, rq.Name)
-			// handleRQ(rq)
+		fmt.Printf("Decoded: apiVersion=%s, kind=%s\n",
+			gvk.GroupVersion().String(), gvk.Kind)
 
-		case "NamespaceQuota":
-			var nq scalingv1.NamespaceQuota
-			if err := yaml.Unmarshal(body, &nq); err != nil {
-				http.Error(w, "cannot parse NamespaceQuota", http.StatusBadRequest)
-				return
-			}
-			fmt.Printf("Parsed NamespaceQuota: %s/%s\n", nq.Namespace, nq.Name)
-			// handleNamespaceQuota(nq)
+		switch o := obj.(type) {
+
+		case *corev1.ResourceQuota:
+			fmt.Printf("Parsed ResourceQuota: %s/%s\n", o.Namespace, o.Name)
+			handleRQFromCluster(k8sClient, *o)
+
+		case *scalingv1.NamespaceQuota:
+			fmt.Printf("Parsed NamespaceQuota: %s/%s\n", o.Namespace, o.Name)
+			handleNamespaceQuota(k8sClient, *o)
 
 		default:
-			fmt.Printf("Unknown kind: %s, ignoring\n", typeMeta.Kind)
+			fmt.Printf("Unknown object type: %T\n", o)
 		}
 
 		w.WriteHeader(http.StatusNoContent)
@@ -153,6 +165,135 @@ func RunQuotaBasedScalingServer(store *HeartbeatStore, addr string, k8sClient ct
 			log.Error(err, "RunQuotaBasedScalingServer server error")
 		}
 	}()
+}
+
+// handle ResourceQuota from workload cluster, create or update NamespaceQuota CR
+func handleRQFromCluster(k8sClient ctrl.Client, rq corev1.ResourceQuota) {
+	ctx := context.Background()
+	log := logf.FromContext(ctx)
+
+	fmt.Printf("Handling ResourceQuota from workload cluster: %s/%s\n", rq.Namespace, rq.Name)
+
+	nqName := rq.Name // assuming same name
+	nqNamespace := rq.Namespace
+
+	// create namespace if not exists
+	ns := &corev1.Namespace{}
+	err := k8sClient.Get(ctx, ctrl.ObjectKey{Name: nqNamespace}, ns)
+	if err != nil {
+		// create new namespace
+		ns = &corev1.Namespace{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Namespace",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: nqNamespace,
+			},
+		}
+		if err := k8sClient.Create(ctx, ns); err != nil {
+			log.Error(err, "failed to create Namespace", "name", nqNamespace)
+			return
+		}
+		log.Info("Created Namespace for ResourceQuota from workload cluster", "name", nqNamespace)
+	}
+
+	nq := &corev1.ResourceQuota{}
+	err = k8sClient.Get(ctx, ctrl.ObjectKey{Namespace: nqNamespace, Name: nqName}, nq)
+	if err != nil {
+		// create new
+		nq = &corev1.ResourceQuota{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "ResourceQuota",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: nqNamespace,
+				Name:      nqName,
+			},
+			Spec: corev1.ResourceQuotaSpec{
+				Hard: rq.Spec.Hard,
+			},
+		}
+		if err := k8sClient.Create(ctx, nq); err != nil {
+			log.Error(err, "failed to create ResourceQuota", "name", nqName)
+			return
+		}
+		log.Info("Created ResourceQuota from ResourceQuota from workload cluster", "name", nqName)
+		return
+	}
+
+	// update existing
+	nq.Spec.Hard = rq.Spec.Hard
+	if err := k8sClient.Update(ctx, nq); err != nil {
+		log.Error(err, "failed to update ResourceQuota from workload cluster", "name", nqName)
+		return
+	}
+	log.Info("Updated ResourceQuota from ResourceQuota from workload cluster", "name", nqName)
+}
+
+func handleNamespaceQuota(k8sClient ctrl.Client, nqCR scalingv1.NamespaceQuota) {
+	ctx := context.Background()
+	log := logf.FromContext(ctx)
+
+	nqName := nqCR.Name // assuming same name
+	nqNamespace := nqCR.Namespace
+
+	// create namespace if not exists
+	ns := &corev1.Namespace{}
+	err := k8sClient.Get(ctx, ctrl.ObjectKey{Name: nqNamespace}, ns)
+	if err != nil {
+		// create new namespace
+		ns = &corev1.Namespace{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Namespace",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: nqNamespace,
+			},
+		}
+		if err := k8sClient.Create(ctx, ns); err != nil {
+			log.Error(err, "failed to create Namespace", "name", nqNamespace)
+			return
+		}
+		log.Info("Created Namespace for ResourceQuota from workload cluster", "name", nqNamespace)
+	}
+
+	nq := &scalingv1.NamespaceQuota{}
+	err = k8sClient.Get(ctx, ctrl.ObjectKey{Namespace: nqNamespace, Name: nqName}, nq)
+	if err != nil {
+		// create new
+		nq = &scalingv1.NamespaceQuota{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "NamespaceQuota",
+				APIVersion: "scaling.dcn.ssu.ac.kr/v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: nqNamespace,
+				Name:      nqName,
+			},
+			Spec: scalingv1.NamespaceQuotaSpec{
+				ClusterRef: nqCR.Spec.ClusterRef,
+				Behavior:   nq.Spec.Behavior,
+			},
+		}
+		if err := k8sClient.Create(ctx, nq); err != nil {
+			log.Error(err, "failed to create NamespaceQuota CR from workload cluster", "name", nqName)
+			return
+		}
+		log.Info("Created NamespaceQuota from NamespaceQuota from workload cluster", "name", nqName)
+		return
+	}
+
+	// update existing
+	nq.Spec.ClusterRef = nqCR.Spec.ClusterRef
+	nq.Spec.Behavior = nqCR.Spec.Behavior
+	if err := k8sClient.Update(ctx, nq); err != nil {
+		log.Error(err, "failed to update NamespaceQuota CR from workload cluster", "name", nqName)
+		return
+	}
+	log.Info("Updated NamespaceQuota from NamespaceQuota from workload cluster", "name", nqName)
 }
 
 func getenvDuration(key string, defaultVal time.Duration) time.Duration {
