@@ -174,3 +174,85 @@ export GIT_SECRET_NAMESPACE="default"
 # On managament cluster, this variable has to be set
 export SERVER_TYPE="MGMT"
 ```
+### 3. The operator has to be installed on management cluster and workload cluster 
+- The package used for testing is in workloads/general/quota-scaling-app
+- Make sure the ResourceQuota has the clusterName label and has the repositoryUrl annotation consisting workload cluster values as shown here:
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata: # kpt-merge: quota-test/test-quota-small
+  name: test-quota-small
+  namespace: quota-test
+  labels:
+    clusterName: myaws
+    
+  annotations:
+    internal.kpt.dev/upstream-identifier: "|ResourceQuota|quota-test|test-quota-small"
+    repositoryUrl: "http://13.212.136.0:30689/nephio/myaws.git"
+# this will detect resource shortage and trigger node scaling
+# spec:
+#   hard:
+#     limits.cpu: "10000m"      # 10 cores only
+#     limits.memory: "40Gi"     # 4 GiB only
+
+spec:
+  hard:
+    limits.cpu: 1000m # 2 cores only
+    limits.memory: 4Gi # 4 GiB only
+
+# this will detect quota shortage and trigger scaling
+
+```
+- The NamespaceQuota has to look like this:
+```yaml
+apiVersion: scaling.dcn.ssu.ac.kr/v1
+kind: NamespaceQuota
+metadata:
+  labels:
+    app.kubernetes.io/name: quota-based-autoscaling
+    app.kubernetes.io/managed-by: kustomize
+  name: namespacequota-sample
+  namespace: quota-test
+spec:
+  clusterRef:
+    name: myaws
+    repositoryUrl: http://13.212.136.0:30689/nephio/myaws.git
+    path: "samples-scaling"
+    endpointServer: http://13.212.136.0:8000
+    managementCluster:
+        name: mgmt
+        repositoryUrl: http://13.212.136.0:30689/nephio/mgmt.git
+
+  # The ResourceQuota in the namespace that this controller/webhook manages
+  appliedQuotaRef:
+    namespace: quota-test
+    name: test-quota-small
+
+  behavior:
+  # Quota Scaling Logic — Increase quota first if cluster has free capacity
+    quotaScaling:
+      enabled: true
+      minQuota:                  # Lower bound for auto-patching quotas
+        cpu: "500m"
+        memory: "512Mi"
+        # nvidia.com/gpu: "0"
+      maxQuota:                   # Upper bound controller will not exceed
+        cpu: "4000m"
+        memory: "4Gi"
+        # nvidia.com/gpu: "4"
+      scaleStep:                  # Increment step for scaling quotas
+        cpu: "500m"
+        memory: "512Mi"
+        # nvidia.com/gpu: "1"
+      targetQuotaUtilization: 70 # Trigger quota increase when usage > 70%
+
+
+    # Node Scaling Logic — If cluster has no free capacity
+    nodeScaling:
+      enabled: true
+      minNodes: 1
+      maxNodes: 2
+      nodeFlavor: standard-medium
+      scaleUpCooldownSeconds: 85   # Prevent rapid, repeated node scaling
+      scaleUpThreshold: 50          # Trigger node scale-up when allocatable usage > 50%
+```
