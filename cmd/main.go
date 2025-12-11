@@ -26,6 +26,7 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	argov1alpha1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
 	scalingv1 "github.com/vitumafeni/quota-based-scaling/api/v1"
 	"github.com/vitumafeni/quota-based-scaling/internal/controller"
 	"github.com/vitumafeni/quota-based-scaling/restapi"
@@ -52,7 +53,7 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
+	utilruntime.Must(argov1alpha1.AddToScheme(scheme)) // ← Add this line
 	utilruntime.Must(corev1.AddToScheme(scheme))
 	utilruntime.Must(scalingv1.AddToScheme(scheme))
 	_ = capiv1beta1.AddToScheme(scheme)
