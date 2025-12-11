@@ -14,6 +14,7 @@ import (
 
 	"github.com/nephio-project/nephio/controllers/pkg/resource"
 	scalingv1 "github.com/vitumafeni/quota-based-scaling/api/v1"
+	"github.com/vitumafeni/quota-based-scaling/reconcilers/capi"
 	git "github.com/vitumafeni/quota-based-scaling/reconcilers/git"
 	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
@@ -200,37 +201,137 @@ func handleRQFromCluster(Mgmtk8sClient ctrl.Client, rq corev1.ResourceQuota) {
 		log.Info("Created Namespace for ResourceQuota from workload cluster", "name", nqNamespace)
 	}
 
-	nq := &corev1.ResourceQuota{}
-	err = Mgmtk8sClient.Get(ctx, ctrl.ObjectKey{Namespace: nqNamespace, Name: nqName}, nq)
+	nqRq := &corev1.ResourceQuota{}
+	err = Mgmtk8sClient.Get(ctx, ctrl.ObjectKey{Namespace: nqNamespace, Name: nqName}, nqRq)
 	if err != nil {
 		// create new
-		nq = &corev1.ResourceQuota{
+		nqRq = &corev1.ResourceQuota{
 			TypeMeta: metav1.TypeMeta{
 				Kind:       "ResourceQuota",
 				APIVersion: "v1",
 			},
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: nqNamespace,
-				Name:      nqName,
+				Namespace:   nqNamespace,
+				Name:        nqName,
+				Labels:      rq.GetLabels(),
+				Annotations: rq.GetAnnotations(),
 			},
 			Spec: corev1.ResourceQuotaSpec{
 				Hard: rq.Spec.Hard,
 			},
 		}
-		if err := Mgmtk8sClient.Create(ctx, nq); err != nil {
+		if err := Mgmtk8sClient.Create(ctx, nqRq); err != nil {
 			log.Error(err, "failed to create ResourceQuota", "name", nqName)
-			return
+			// return
 		}
 		log.Info("Created ResourceQuota from ResourceQuota from workload cluster", "name", nqName)
-		return
+		// return
 	}
 
 	// update existing
-	nq.Spec.Hard = rq.Spec.Hard
-	if err := Mgmtk8sClient.Update(ctx, nq); err != nil {
+	nqRq.Spec.Hard = rq.Spec.Hard
+	if err := Mgmtk8sClient.Update(ctx, nqRq); err != nil {
 		log.Error(err, "failed to update ResourceQuota from workload cluster", "name", nqName)
+		// return
+	}
+
+	// find associated NamespaceQuota object
+	resourceQuotaLabels := rq.GetLabels()
+	resourceQuotaAnnotations := rq.GetAnnotations()
+
+	clusterName := resourceQuotaLabels["clusterName"]
+	repoURL := resourceQuotaAnnotations["repositoryUrl"]
+
+	if clusterName == "" || repoURL == "" {
+		log.Error(err, "The ResourceQuota Resource is missing ClusterName and repositoryUrl labels", "name", nqName)
 		return
 	}
+	log.Info("repository workload xl: " + repoURL)
+
+	username, password, _, err := git.GetGiteaSecretUserNamePassword(ctx, Mgmtk8sClient)
+	if err != nil {
+		log.Error(err, "Failed to get Gitea credentials")
+		return
+	}
+
+	// Wrap the controller-runtime client into a resource.APIPatchingApplicator
+	applier := resource.NewAPIPatchingApplicator(Mgmtk8sClient)
+
+	giteaClient, err := git.GetClient(ctx, applier)
+	if err != nil {
+		log.Error(err, "Failed to initialize Gitea client")
+		return
+	}
+
+	if !giteaClient.IsInitialized() {
+		log.Info("Gitea client not yet initialized, retrying later")
+		return
+	}
+
+	// modify cluster api resources in the repo by incrementing node count of matching manifests
+	tmpDir, matches, err := git.CheckRepoForMatchingResourceQuotaManifests(ctx, repoURL, "main", &rq)
+	if err != nil {
+		log.Error(err, "Failed to find matching ResourceQuota  manifests in source repo", "repo", clusterName)
+		return
+	}
+
+	// log.Info("number of matched files", "count", len(matches))
+
+	if len(matches) == 0 {
+		log.Info("No matching ResourceQuota manifests found in repo", "repo", repoURL)
+		return
+	}
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 2) // Limit to 2 concurrent file operations (good for 2 vCPUs)
+	errChan := make(chan error, len(matches))
+
+	for _, f := range matches {
+		wg.Add(1)
+		go func(file string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			if err := git.UpdateResourceQuota(file, rq); err != nil {
+				errChan <- fmt.Errorf("failed to update resource quota manifest %s: %w", file, err)
+			}
+		}(f)
+	}
+	wg.Wait()
+	close(errChan)
+
+	for e := range errChan {
+		if e != nil {
+			log.Error(e, "Manifest ResourceQuota update error for scaling")
+			return
+		}
+	}
+
+	commitMsg := fmt.Sprintf("Update resource quota resource for %s/%s",
+		clusterName, nqRq.Name)
+
+	if err := git.CommitAndPush(ctx, tmpDir, "main", repoURL, username, password, commitMsg); err != nil {
+		log.Error(err, "Failed to commit & push changes for mgmt repo")
+		return
+	}
+
+	// get kubeconfig for workload cluster by name
+	_, workloadClusterClient, _, err := capi.GetWorkloadClusterClient(ctx, Mgmtk8sClient, clusterName)
+	if err != nil {
+		log.Error(err, "failed to get workload cluster kubeconfig")
+		return
+	}
+	if workloadClusterClient == nil {
+		log.Info("Cluster client not available yet; skipping triggering argocd sync", "cluster", clusterName)
+		return
+	}
+
+	if err := git.TriggerArgoCDSyncWithKubeClient(workloadClusterClient, clusterName, "argocd"); err != nil {
+		log.Error(err, "Failed to trigger argocd sync with kubeclient for "+clusterName)
+		return
+	}
+
 	log.Info("Updated ResourceQuota from ResourceQuota from workload cluster", "name", nqName)
 }
 

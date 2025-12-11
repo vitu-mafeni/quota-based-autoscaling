@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+
 	argov1alpha1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
@@ -44,11 +46,11 @@ type MatchingNadFiles struct {
 // CheckRepoForMatchingManifests clones a repo and searches YAML files for a name/namespace match.
 // CheckRepoForMatchingManifests clones a Git repo and scans it for YAML manifests
 // matching a given ResourceRef. Uses concurrent workers for faster scanning.
-func CheckRepoForMatchingNamespaceQuotaManifests(
+func CheckRepoForMatchingResourceQuotaManifests(
 	ctx context.Context,
 	repoURL string,
 	branch string,
-	resourceRef *scalingv1.NamespaceQuota,
+	resourceRef *corev1.ResourceQuota,
 ) (cloneDirectory string, matchingFiles []string, err error) {
 
 	log := logf.FromContext(ctx)
@@ -430,9 +432,45 @@ func UpdateResourceReplicasNamespaceQuotaCR(path string, newReplicaCount int) (r
 	return newReplicaCount, os.WriteFile(path, out, 0644)
 }
 
+func UpdateResourceQuota(path string, resourceQuotaSpec corev1.ResourceQuota) (error error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read file: %w", err)
+	}
+
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return fmt.Errorf("unmarshal yaml: %w", err)
+	}
+
+	kind, _ := doc["kind"].(string)
+	if !isSupportedKind(kind) {
+		return fmt.Errorf("%s: unsupported Kind %q", path, kind)
+	}
+
+	spec, ok := doc["spec"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("%s: missing spec", path)
+	}
+
+	hard := map[string]string{}
+	for k, v := range resourceQuotaSpec.Spec.Hard {
+		hard[string(k)] = v.String() // convert to literal form like "1000m"
+	}
+
+	spec["hard"] = hard
+
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("marshal yaml: %w", err)
+	}
+
+	return os.WriteFile(path, out, 0644)
+}
+
 func isSupportedKind(k string) bool {
 	switch k {
-	case "MachineDeployment", "NamespaceQuota":
+	case "MachineDeployment", "NamespaceQuota", "ResourceQuota":
 		return true
 	default:
 		return false

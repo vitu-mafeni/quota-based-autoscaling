@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -66,6 +67,11 @@ type ClusterFree struct {
 
 func (r *NamespaceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	serverType := os.Getenv("SERVER_TYPE")
+	if serverType != "" && serverType == "MGMT" {
+		return ctrl.Result{}, nil
+	}
 
 	logger.Info("------------------ Starting reconciliation", "request", req.NamespacedName)
 
