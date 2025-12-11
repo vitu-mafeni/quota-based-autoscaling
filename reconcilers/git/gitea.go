@@ -134,6 +134,7 @@ func CheckRepoForMatchingResourceQuotaManifests(
 					obj.Metadata.Name == resourceRef.Name &&
 					objNs == refNs {
 					matchCh <- path
+					log.Info("file matched ")
 					// don't break: one file may contain multiple matches
 				}
 			}

@@ -201,39 +201,39 @@ func handleRQFromCluster(Mgmtk8sClient ctrl.Client, rq corev1.ResourceQuota) {
 		log.Info("Created Namespace for ResourceQuota from workload cluster", "name", nqNamespace)
 	}
 
-	nqRq := &corev1.ResourceQuota{}
-	err = Mgmtk8sClient.Get(ctx, ctrl.ObjectKey{Namespace: nqNamespace, Name: nqName}, nqRq)
-	if err != nil {
-		// create new
-		nqRq = &corev1.ResourceQuota{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "ResourceQuota",
-				APIVersion: "v1",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   nqNamespace,
-				Name:        nqName,
-				Labels:      rq.GetLabels(),
-				Annotations: rq.GetAnnotations(),
-			},
-			Spec: corev1.ResourceQuotaSpec{
-				Hard: rq.Spec.Hard,
-			},
-		}
-		if err := Mgmtk8sClient.Create(ctx, nqRq); err != nil {
-			log.Error(err, "failed to create ResourceQuota", "name", nqName)
-			// return
-		}
-		log.Info("Created ResourceQuota from ResourceQuota from workload cluster", "name", nqName)
-		// return
-	}
+	// nqRq := &corev1.ResourceQuota{}
+	// err = Mgmtk8sClient.Get(ctx, ctrl.ObjectKey{Namespace: nqNamespace, Name: nqName}, nqRq)
+	// if err != nil {
+	// 	// create new
+	// 	nqRq = &corev1.ResourceQuota{
+	// 		TypeMeta: metav1.TypeMeta{
+	// 			Kind:       "ResourceQuota",
+	// 			APIVersion: "v1",
+	// 		},
+	// 		ObjectMeta: metav1.ObjectMeta{
+	// 			Namespace:   nqNamespace,
+	// 			Name:        nqName,
+	// 			Labels:      rq.GetLabels(),
+	// 			Annotations: rq.GetAnnotations(),
+	// 		},
+	// 		Spec: corev1.ResourceQuotaSpec{
+	// 			Hard: rq.Spec.Hard,
+	// 		},
+	// 	}
+	// 	if err := Mgmtk8sClient.Create(ctx, nqRq); err != nil {
+	// 		log.Error(err, "failed to create ResourceQuota", "name", nqName)
+	// 		// return
+	// 	}
+	// 	log.Info("Created ResourceQuota from ResourceQuota from workload cluster", "name", nqName)
+	// 	// return
+	// }
 
 	// update existing
-	nqRq.Spec.Hard = rq.Spec.Hard
-	if err := Mgmtk8sClient.Update(ctx, nqRq); err != nil {
-		log.Error(err, "failed to update ResourceQuota from workload cluster", "name", nqName)
-		// return
-	}
+	// nqRq.Spec.Hard = rq.Spec.Hard
+	// if err := Mgmtk8sClient.Update(ctx, nqRq); err != nil {
+	// 	log.Error(err, "failed to update ResourceQuota from workload cluster", "name", nqName)
+	// 	// return
+	// }
 
 	// find associated NamespaceQuota object
 	resourceQuotaLabels := rq.GetLabels()
@@ -309,7 +309,7 @@ func handleRQFromCluster(Mgmtk8sClient ctrl.Client, rq corev1.ResourceQuota) {
 	}
 
 	commitMsg := fmt.Sprintf("Update resource quota resource for %s/%s",
-		clusterName, nqRq.Name)
+		clusterName, rq.Name)
 
 	if err := git.CommitAndPush(ctx, tmpDir, "main", repoURL, username, password, commitMsg); err != nil {
 		log.Error(err, "Failed to commit & push changes for mgmt repo")
