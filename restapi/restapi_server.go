@@ -380,60 +380,12 @@ func handleNamespaceQuota(Mgmtk8sClient ctrl.Client, nqCR scalingv1.NamespaceQuo
 		return
 	}
 
-	/*
+	if err := git.TriggerArgoCDSyncWithKubeClient(Mgmtk8sClient, nqCR.Spec.ClusterRef.ManagementCluster.Name, "argocd"); err != nil {
+		log.Error(err, "Failed to trigger argocd sync with kubeclient for "+nqCR.Spec.ClusterRef.ManagementCluster.Name)
+		return
+	}
 
-		// start with workload cluster repo to find matching manifests and update the replica count
-		_, matchesWkld, err := git.CheckRepoForMatchingNamespaceQuotaManifests(ctx, nqCR.Spec.ClusterRef.RepositoryURL, "main", nsQuotaObject)
-		if err != nil {
-
-			log.Error(err, "Failed to find matching manifests in source repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
-			return
-		}
-
-		if len(matchesWkld) == 0 {
-			log.Info("No matching manifests found in the source repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
-			// _, err = CreateAndPushNamespaceQuotaCR(ctx, giteaClient.Get(), username, nqCR.Spec.ClusterRef.Name, nqCR.Spec.ClusterRef.Path, nsQuotaObject)
-			// if err != nil {
-			// 	log.Error(err, "Failed to push NamespaceQuota CR to management repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
-			// }
-			// log.Info("created and push a new NamespaceQuota CR", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
-
-			return
-		}
-
-		// Parallelize manifest updates (limit concurrency to avoid CPU exhaustion)
-		var wg3 sync.WaitGroup
-		sem3 := make(chan struct{}, 2) // Limit to 2 concurrent file operations (good for 2 vCPUs)
-		errChan3 := make(chan error, len(matchesWkld))
-
-		for _, f := range matchesWkld {
-			wg3.Add(1)
-			go func(file string) {
-				defer wg3.Done()
-				sem3 <- struct{}{}
-				defer func() { <-sem3 }()
-
-				if newReplicaCount, err = git.UpdateResourceReplicasNamespaceQuotaCR(file,
-
-					newReplicaCount); err != nil {
-					errChan3 <- fmt.Errorf("failed to update machine deploymenty manifest %s: %w", file, err)
-				}
-			}(f)
-		}
-		wg3.Wait()
-		close(errChan3)
-
-		for e := range errChan3 {
-			if e != nil {
-				log.Error(e, "Manifest update error for scaling")
-				return
-			}
-		}
-
-	*/
-
-	// log.Info("Found matching manifests", "count", len(matchesMgmt), "repo", nqCR.Spec.ClusterRef.RepositoryURL)
-	log.Info("Updated NamespaceQuota from NamespaceQuota from workload cluster, pushed to git success", "name", nqName)
+	log.Info("Updated MachineDeployment from NamespaceQuota from workload cluster, pushed to git success", "name", nqName)
 }
 
 func getenvDuration(key string, defaultVal time.Duration) time.Duration {
