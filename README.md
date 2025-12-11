@@ -171,7 +171,7 @@ kubectl create secret generic git-user-secret \
 export GIT_SERVER_URL="http://47.129.115.173:31413"
 export GIT_SECRET_NAME="git-user-secret"
 export GIT_SECRET_NAMESPACE="default"
-# On managament cluster, this variable has to be set
+# On management cluster, this variable has to be set
 export SERVER_TYPE="MGMT"
 ```
 ### 3. The operator has to be installed on management cluster and workload cluster 
