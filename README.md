@@ -256,3 +256,7 @@ spec:
       scaleUpCooldownSeconds: 85   # Prevent rapid, repeated node scaling
       scaleUpThreshold: 50          # Trigger node scale-up when allocatable usage > 50%
 ```
+
+## Next steps
+- Scale node based on specified flavor which will add different type of node flavors to the cluster
+- Apply Rate limiting to namespace 
