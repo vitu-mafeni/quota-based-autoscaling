@@ -193,10 +193,158 @@ func CheckRepoForMatchingNamespaceQuotaManifests(
 	}
 }
 
+// CheckRepo for matching Cluster API manifests
+func CheckRepoForMatchingClusterAPIManifestsMgmt(
+	ctx context.Context,
+	branch string,
+	resourceRef *scalingv1.NamespaceQuota,
+) (cloneDirectory string, matchingFiles []string, err error) {
+
+	log := logf.FromContext(ctx)
+	log.Info("Cloning repo", "url", resourceRef.Spec.ClusterRef.ManagementCluster.RepositoryURL, "branch", branch)
+
+	// Create temp directory
+	tmpDir, err := os.MkdirTemp("", resourceRef.Spec.ClusterRef.ManagementCluster.Name+"-*")
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Clone repo shallowly
+	_, err = git.PlainCloneContext(ctx, tmpDir, false, &git.CloneOptions{
+		URL:           resourceRef.Spec.ClusterRef.ManagementCluster.RepositoryURL,
+		ReferenceName: gitplumbing.ReferenceName("refs/heads/" + branch),
+		Depth:         1,
+		SingleBranch:  true,
+	})
+	if err != nil {
+		return "", nil, fmt.Errorf("git clone failed: %w", err)
+	}
+
+	// Channels for work and results
+	fileCh := make(chan string, 100)
+	matchCh := make(chan string, 100)
+	errCh := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	workerCount := runtime.NumCPU()
+
+	// Worker function
+	worker := func() {
+		defer wg.Done()
+		for path := range fileCh {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			data, err := os.ReadFile(path)
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+
+			dec := yaml.NewDecoder(bytes.NewReader(data))
+			for {
+				var obj struct {
+					Kind     string `yaml:"kind"`
+					Metadata struct {
+						Name      string `yaml:"name"`
+						Namespace string `yaml:"namespace"`
+					} `yaml:"metadata"`
+				}
+
+				if err := dec.Decode(&obj); err != nil {
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+
+				// objNs := obj.Metadata.Namespace
+				// if objNs == "" {
+				// 	objNs = "default"
+				// }
+				// refNs := resourceRef.Namespace
+				// if refNs == "" {
+				// 	refNs = "default"
+				// }
+
+				if obj.Kind == "MachineDeployment" &&
+					obj.Metadata.Name == resourceRef.Spec.ClusterRef.Name+"-md-0" {
+					matchCh <- path
+					// don't break: one file may contain multiple matches
+				}
+			}
+		}
+	}
+
+	// Start workers
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go worker()
+	}
+
+	// Walk directory and enqueue YAML files
+	go func() {
+		defer close(fileCh)
+		filepath.WalkDir(tmpDir, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				select {
+				case errCh <- walkErr:
+				default:
+				}
+				return walkErr
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if ext := strings.ToLower(filepath.Ext(path)); ext == ".yaml" || ext == ".yml" {
+				fileCh <- path
+			}
+			return nil
+		})
+	}()
+
+	// Collect matches concurrently
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(matchCh)
+		close(done)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return tmpDir, nil, ctx.Err()
+		case e := <-errCh:
+			if e != nil {
+				return tmpDir, nil, e
+			}
+		case path, ok := <-matchCh:
+			if !ok {
+				// done
+				return tmpDir, matchingFiles, nil
+			}
+			matchingFiles = append(matchingFiles, path)
+		case <-done:
+			return tmpDir, matchingFiles, nil
+		}
+	}
+}
+
 // UpdateResourceContainers updates matching container images
 // inside a local Kubernetes manifest file.
 // images: map[containerName]newImage
-func UpdateResourceContainers(path string, imageCheckpoint, originalImage string) error {
+func UpdateResourceReplicasMachineDeployment(path string, nodeScalingDefined scalingv1.NodeScaling) (error error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read file: %w", err)
@@ -217,60 +365,78 @@ func UpdateResourceContainers(path string, imageCheckpoint, originalImage string
 		return fmt.Errorf("%s: missing spec", path)
 	}
 
-	// All these workload types keep pod spec under spec.template.spec
-	tpl, ok := spec["template"].(map[string]interface{})
+	replicaCount, ok := spec["replicas"].(int)
 	if !ok {
-		return fmt.Errorf("%s: missing spec.template", path)
+		// replicas field missing or not an int
+		return fmt.Errorf("%s: missing or invalid spec.replicas", path)
 	}
-	resourceSpec, ok := tpl["spec"].(map[string]interface{})
-	if !ok {
-		return fmt.Errorf("%s: missing spec.template.spec", path)
+	if replicaCount == 0 || replicaCount == nodeScalingDefined.MaxNodes {
+		// no replicas to update
+		return nil
 	}
 
-	changed := updateContainers(resourceSpec, imageCheckpoint, originalImage)
-	if !changed {
-		return nil // nothing to do
+	newReplicaCount := replicaCount + 1
+	if newReplicaCount > nodeScalingDefined.MaxNodes {
+		newReplicaCount = nodeScalingDefined.MaxNodes
 	}
+	spec["replicas"] = newReplicaCount
 
 	out, err := yaml.Marshal(doc)
 	if err != nil {
 		return fmt.Errorf("marshal yaml: %w", err)
 	}
 
-	if changed {
-		fmt.Printf("Updated container image %s: %s -> %s\n", path, originalImage, imageCheckpoint)
+	return os.WriteFile(path, out, 0644)
+}
+
+func UpdateResourceReplicasNamespaceQuotaCR(path string, newReplicaCount int) (replicaCountNew int, error error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return -1, fmt.Errorf("read file: %w", err)
 	}
 
-	return os.WriteFile(path, out, 0644)
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return -1, fmt.Errorf("unmarshal yaml: %w", err)
+	}
+
+	kind, _ := doc["kind"].(string)
+	if !isSupportedKind(kind) {
+		return -1, fmt.Errorf("%s: unsupported Kind %q", path, kind)
+	}
+
+	spec, ok := doc["spec"].(map[string]interface{})
+	if !ok {
+		return -1, fmt.Errorf("%s: missing spec", path)
+	}
+
+	tpl, ok := spec["behavior"].(map[string]interface{})
+	if !ok {
+		return -1, fmt.Errorf("%s: missing spec.behavior", path)
+	}
+
+	bhv, ok := tpl["nodeScaling"].(map[string]interface{})
+	if !ok {
+		return -1, fmt.Errorf("%s: missing spec.behavior.nodeScaling", path)
+	}
+
+	bhv["replicas"] = newReplicaCount
+
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return -1, fmt.Errorf("marshal yaml: %w", err)
+	}
+
+	return newReplicaCount, os.WriteFile(path, out, 0644)
 }
 
 func isSupportedKind(k string) bool {
 	switch k {
-	case "Deployment", "ReplicaSet", "DaemonSet", "StatefulSet":
+	case "MachineDeployment", "NamespaceQuota":
 		return true
 	default:
 		return false
 	}
-}
-
-// updateContainers updates containers and initContainers by name.
-func updateContainers(resourceSpec map[string]interface{}, imageCheckpoint, originalImage string) bool {
-	changed := false
-	for _, field := range []string{"containers", "initContainers"} {
-		if arr, ok := resourceSpec[field].([]interface{}); ok {
-			for _, c := range arr {
-				if cm, ok := c.(map[string]interface{}); ok {
-					if image, _ := cm["image"].(string); image != "" {
-						if image == originalImage {
-							cm["image"] = imageCheckpoint
-							changed = true
-						}
-					}
-				}
-			}
-		}
-	}
-	return changed
 }
 
 // CommitAndPush commits all staged changes in cloneDir and pushes to the remote branch.

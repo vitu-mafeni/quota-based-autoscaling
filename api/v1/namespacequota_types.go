@@ -45,6 +45,7 @@ type ClusterRef struct {
 	ManagementCluster ManagementCluster `json:"managementCluster,omitempty"`
 }
 type ManagementCluster struct {
+	Name          string `json:"name,omitempty"`
 	RepositoryURL string `json:"repositoryUrl,omitempty"`
 }
 

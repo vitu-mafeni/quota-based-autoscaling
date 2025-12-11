@@ -156,3 +156,19 @@ spec:
 - Pods remain pending
 → Thew= controller detects no free cluster resources
 → Node Scale-Up triggered
+
+## installation steps
+
+### 1. Create the gitea secret
+```bash
+kubectl create secret generic git-user-secret \
+  --from-literal=username=nephio \
+  --from-literal=password=secret \
+  -n default
+```
+### 2. Create the following environment variables where you will run the controller
+```bash
+export GIT_SERVER_URL="http://47.129.115.173:31413"
+export GIT_SECRET_NAME="git-user-secret"
+export GIT_SECRET_NAMESPACE="default"
+```

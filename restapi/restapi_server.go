@@ -305,7 +305,7 @@ func handleNamespaceQuota(Mgmtk8sClient ctrl.Client, nqCR scalingv1.NamespaceQuo
 		return
 	}
 
-	username, _, _, err := git.GetGiteaSecretUserNamePassword(ctx, Mgmtk8sClient)
+	username, password, _, err := git.GetGiteaSecretUserNamePassword(ctx, Mgmtk8sClient)
 	if err != nil {
 		log.Error(err, "Failed to get Gitea credentials")
 		return
@@ -325,32 +325,114 @@ func handleNamespaceQuota(Mgmtk8sClient ctrl.Client, nqCR scalingv1.NamespaceQuo
 		return
 	}
 
-	// user, resp, err := giteaClient.GetMyUserInfo()
-	// if err != nil {
-	// 	log.Error(err, "Failed to get Gitea user info", "response", resp)
-	// 	return
-	// }
-
-	// start with managment cluster repo to find matching manifests
-	_, matchesMgmt, err := git.CheckRepoForMatchingNamespaceQuotaManifests(ctx, nqCR.Spec.ClusterRef.RepositoryURL, "main", nsQuotaObject)
+	// modify cluster api resources in the repo by incrementing node count of matching manifests
+	tmpDirMgmt2, matchesMgmt2, err := git.CheckRepoForMatchingClusterAPIManifestsMgmt(ctx, "main", nsQuotaObject)
 	if err != nil {
-
-		log.Error(err, "Failed to find matching manifests in source repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+		log.Error(err, "Failed to find matching cluster API  manifests in source repo", "repo", nqCR.Spec.ClusterRef.ManagementCluster.RepositoryURL)
 		return
 	}
 
-	if len(matchesMgmt) == 0 {
-		log.Info("No matching manifests found, pushing a new one to mgmt repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
-		_, err = CreateAndPushNamespaceQuotaCR(ctx, giteaClient.Get(), username, nqCR.Spec.ClusterRef.Name, nqCR.Spec.ClusterRef.Path, nsQuotaObject)
-		if err != nil {
-			log.Error(err, "Failed to push NamespaceQuota CR to management repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+	if len(matchesMgmt2) == 0 {
+		log.Info("No matching cluster API manifests found in mgmt repo - canceling operation", "repo", nqCR.Spec.ClusterRef.ManagementCluster.RepositoryURL)
+		return
+	}
+
+	// newReplicaCount := -1
+
+	// Parallelize manifest updates (limit concurrency to avoid CPU exhaustion)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 2) // Limit to 2 concurrent file operations (good for 2 vCPUs)
+	errChan := make(chan error, len(matchesMgmt2))
+
+	for _, f := range matchesMgmt2 {
+		wg.Add(1)
+		go func(file string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			if err := git.UpdateResourceReplicasMachineDeployment(file, nqCR.Spec.Behavior.NodeScaling); err != nil {
+				errChan <- fmt.Errorf("failed to update machine deploymenty manifest %s: %w", file, err)
+			}
+		}(f)
+	}
+	wg.Wait()
+	close(errChan)
+
+	for e := range errChan {
+		if e != nil {
+			log.Error(e, "Manifest update error for scaling")
+			return
 		}
-		log.Info("created and push a new NamespaceQuota CR", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+	}
 
+	// Commit & push changes
+	username, password, _, err = git.GetGiteaSecretUserNamePassword(ctx, Mgmtk8sClient)
+	if err != nil {
+		log.Error(err, "Failed to get Gitea credentials")
+		return
+	}
+	commitMsg := fmt.Sprintf("Update node replica count for %s/%s",
+		nqCR.Spec.ClusterRef.Name, nqCR.Spec.ClusterRef.Path)
+
+	if err := git.CommitAndPush(ctx, tmpDirMgmt2, "main", nqCR.Spec.ClusterRef.ManagementCluster.RepositoryURL, username, password, commitMsg); err != nil {
+		log.Error(err, "Failed to commit & push changes for mgmt repo")
 		return
 	}
 
-	log.Info("Found matching manifests", "count", len(matchesMgmt), "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+	/*
+
+		// start with workload cluster repo to find matching manifests and update the replica count
+		_, matchesWkld, err := git.CheckRepoForMatchingNamespaceQuotaManifests(ctx, nqCR.Spec.ClusterRef.RepositoryURL, "main", nsQuotaObject)
+		if err != nil {
+
+			log.Error(err, "Failed to find matching manifests in source repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+			return
+		}
+
+		if len(matchesWkld) == 0 {
+			log.Info("No matching manifests found in the source repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+			// _, err = CreateAndPushNamespaceQuotaCR(ctx, giteaClient.Get(), username, nqCR.Spec.ClusterRef.Name, nqCR.Spec.ClusterRef.Path, nsQuotaObject)
+			// if err != nil {
+			// 	log.Error(err, "Failed to push NamespaceQuota CR to management repo", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+			// }
+			// log.Info("created and push a new NamespaceQuota CR", "repo", nqCR.Spec.ClusterRef.RepositoryURL)
+
+			return
+		}
+
+		// Parallelize manifest updates (limit concurrency to avoid CPU exhaustion)
+		var wg3 sync.WaitGroup
+		sem3 := make(chan struct{}, 2) // Limit to 2 concurrent file operations (good for 2 vCPUs)
+		errChan3 := make(chan error, len(matchesWkld))
+
+		for _, f := range matchesWkld {
+			wg3.Add(1)
+			go func(file string) {
+				defer wg3.Done()
+				sem3 <- struct{}{}
+				defer func() { <-sem3 }()
+
+				if newReplicaCount, err = git.UpdateResourceReplicasNamespaceQuotaCR(file,
+
+					newReplicaCount); err != nil {
+					errChan3 <- fmt.Errorf("failed to update machine deploymenty manifest %s: %w", file, err)
+				}
+			}(f)
+		}
+		wg3.Wait()
+		close(errChan3)
+
+		for e := range errChan3 {
+			if e != nil {
+				log.Error(e, "Manifest update error for scaling")
+				return
+			}
+		}
+
+	*/
+
+	// log.Info("Found matching manifests", "count", len(matchesMgmt), "repo", nqCR.Spec.ClusterRef.RepositoryURL)
 	log.Info("Updated NamespaceQuota from NamespaceQuota from workload cluster, pushed to git success", "name", nqName)
 }
 
