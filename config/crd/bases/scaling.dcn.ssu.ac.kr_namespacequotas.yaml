@@ -98,6 +98,8 @@ spec:
                     type: string
                   managementCluster:
                     properties:
+                      name:
+                        type: string
                       repositoryUrl:
                         type: string
                     type: object
