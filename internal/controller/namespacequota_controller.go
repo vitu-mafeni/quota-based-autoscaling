@@ -23,9 +23,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	"gopkg.in/yaml.v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/yaml"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -48,6 +49,10 @@ import (
 type NamespaceQuotaReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Add the rate limiter map
+	lastScale map[string]time.Time
+	mu        sync.Mutex
 }
 
 type ClusterFree struct {
@@ -165,8 +170,10 @@ func (r *NamespaceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			// schedulable
 			logger.Info("At least one pod in the namespace is schedulable on the cluster")
 		} else {
+
 			// not schedulable
 			logger.Info("No pod in the namespace is schedulable on the cluster - skipping quota patch")
+			r.TriggerScaleUpResourceQuota(rq.Namespace)
 			return ctrl.Result{}, nil
 		}
 
@@ -177,6 +184,7 @@ func (r *NamespaceQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if shortage {
 			logger.Info("Resource Shortage Detected → Scale Node or Patch Quota", "reason", msg)
 			// Trigger your quota patching / node autoscaling logic here
+			r.TriggerScaleUpForCluster(req.Namespace)
 		}
 
 		return ctrl.Result{}, nil
@@ -664,14 +672,149 @@ func (r *NamespaceQuotaReconciler) TriggerScaleUpForCluster(namespace string) er
 	})
 
 	// Call external system status reflects the trigger
-	if err := postYAML(&nsq, nsq.Spec.ClusterRef.EndpointServer); err != nil {
+	API_ENDPOINT := os.Getenv("API_ENDPOINT")
+	if API_ENDPOINT == "" {
+		return fmt.Errorf("controller api endpoint is not defined %s", namespace)
+	}
+	API_ENDPOINT = API_ENDPOINT + "/quotabased-scaling"
+	logger.Info("Controller API endpoint: " + API_ENDPOINT)
+
+	// print the raw resource
+
+	// Call external system status reflects the trigger
+	if err := postYAML(&nsq, API_ENDPOINT); err != nil {
 		return fmt.Errorf("scale-up API failed: %w", err)
 	}
-
 	logger.Info("Node Scaling triggered", "namespace", namespace)
 	return nil
 }
 
+func (r *NamespaceQuotaReconciler) TriggerScaleUpResourceQuota(namespace string) error {
+	ctx := context.Background()
+	logger := log.FromContext(ctx)
+
+	// Throttle: allow once per minute per namespace
+	if !r.allowScale(namespace, time.Minute) {
+		logger.Info("Skipping scale-up: throttled (min 1 minute)", "namespace", namespace)
+		return nil
+	}
+
+	logger.Info("Scale-up allowed", "namespace", namespace)
+
+	// Find NamespaceQuota in the namespace
+	var list corev1.ResourceQuotaList
+	if err := r.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+		return fmt.Errorf("failed listing: %w", err)
+	}
+
+	if len(list.Items) == 0 {
+		return fmt.Errorf("no resourcequota  found in namespace %q", namespace)
+	}
+	if len(list.Items) > 1 {
+		return fmt.Errorf("multiple resourcequota resources found in namespace %q, only one should exist", namespace)
+	}
+
+	n := list.Items[0]
+	logger.Info("Resolved resourcequota", "namespace", namespace, "name", n.Name)
+
+	// Re-fetch owned object before modifying
+	var rq corev1.ResourceQuota
+	key := types.NamespacedName{Name: n.Name, Namespace: n.Namespace}
+	if err := r.Get(ctx, key, &rq); err != nil {
+		logger.Error(err, "failed to get resource quota")
+		return err
+	}
+
+	var listNsq scalingv1.NamespaceQuotaList
+	if err := r.List(ctx, &listNsq, client.InNamespace(namespace)); err != nil {
+		return fmt.Errorf("failed listing: %w", err)
+	}
+
+	if len(listNsq.Items) == 0 {
+		return fmt.Errorf("no NamespaceQuota found in namespace %q", namespace)
+	}
+
+	if len(listNsq.Items) > 1 {
+		return fmt.Errorf("multiple NamespaceQuota resources found in namespace %q, only one should exist", namespace)
+	}
+
+	nNsp := listNsq.Items[0]
+	logger.Info("Resolved NamespaceQuota", "namespace", namespace, "name", n.Name)
+
+	// Re-fetch owned object before modifying
+	var nsq scalingv1.NamespaceQuota
+	keyNsq := types.NamespacedName{Name: nNsp.Name, Namespace: nNsp.Namespace}
+	if err := r.Get(ctx, keyNsq, &nsq); err != nil {
+
+		return err
+	}
+
+	// printYAML("RAW ResourceQuota AFTER UPDATE (YAML)", &rq)
+
+	// CPU increment
+	// Extract increments from NamespaceQuota CR
+	stepCPU := nsq.Spec.Behavior.QuotaScaling.ScaleStep["cpu"]
+	stepMem := nsq.Spec.Behavior.QuotaScaling.ScaleStep["memory"]
+
+	cpuStepQty, err := resource.ParseQuantity(stepCPU)
+	if err != nil {
+		return fmt.Errorf("invalid cpu step %q: %w", stepCPU, err)
+	}
+
+	memStepQty, err := resource.ParseQuantity(stepMem)
+	if err != nil {
+		return fmt.Errorf("invalid memory step %q: %w", stepMem, err)
+	}
+
+	// Existing ResourceQuota values
+	existingCPU := rq.Spec.Hard[corev1.ResourceLimitsCPU]
+	existingMem := rq.Spec.Hard[corev1.ResourceLimitsMemory]
+
+	// Add increment
+	newCPU := existingCPU.DeepCopy()
+	newCPU.Add(cpuStepQty)
+
+	newMem := existingMem.DeepCopy()
+	newMem.Add(memStepQty)
+
+	// Write back
+	rq.Spec.Hard[corev1.ResourceLimitsCPU] = newCPU
+	rq.Spec.Hard[corev1.ResourceLimitsMemory] = newMem
+
+	// // Patch/update RQ
+	// if err := r.Update(ctx, &rq); err != nil {
+	// 	return err
+	// }
+
+	API_ENDPOINT := os.Getenv("API_ENDPOINT")
+	if API_ENDPOINT == "" {
+		return fmt.Errorf("controller api endpoint is not defined %s", namespace)
+	}
+	API_ENDPOINT = API_ENDPOINT + "/quotabased-scaling"
+	logger.Info("Controller API endpoint: " + API_ENDPOINT)
+
+	// print the raw resource
+
+	// Call external system status reflects the trigger
+	if err := postYAML(&rq, API_ENDPOINT); err != nil {
+		return fmt.Errorf("scale-up API failed: %w", err)
+	}
+
+	// printYAML("RAW ResourceQuota AFTER UPDATE (YAML)", &rq)
+
+	logger.Info("quota Scaling triggered", "namespace", namespace)
+	return nil
+}
+
+func printYAML(label string, obj interface{}) {
+	fmt.Println("===== " + label + " =====")
+	out, err := yaml.Marshal(obj)
+	if err != nil {
+		fmt.Println("YAML marshal error:", err)
+		return
+	}
+	fmt.Println(string(out))
+}
 func detectWorkloadShortage(ctx context.Context, c client.Client, ns string) (bool, string, error) {
 	var rsList appsv1.ReplicaSetList
 	if err := c.List(ctx, &rsList, client.InNamespace(ns)); err != nil {
@@ -698,7 +841,7 @@ func detectWorkloadShortage(ctx context.Context, c client.Client, ns string) (bo
 								strings.Contains(e.Message, "Insufficient") ||
 								strings.Contains(e.Message, "nodes are available")) {
 
-							return true, e.Message, nil // 🚨 shortage detected!
+							return true, e.Message, nil // shortage detected!
 						}
 					}
 				}
@@ -789,12 +932,13 @@ func (r *NamespaceQuotaReconciler) watchEventsCluster(ctx context.Context, obj c
 
 	if strings.Contains(strings.ToLower(ev.Message), "exceeded quota") {
 		logger.Info("quota exceeded", "eventNamespace", ev.InvolvedObject.Namespace, "eventMessage", ev.Message)
+		r.TriggerScaleUpResourceQuota(ev.InvolvedObject.Namespace)
 	} else {
 		logger.Info("Resource outtage", "eventNamespace", ev.InvolvedObject.Namespace, "eventMessage", ev.Message)
-		err := r.TriggerScaleUpForCluster(ev.InvolvedObject.Namespace)
-		if err != nil {
-			logger.Error(err, "Failed to trigger scale up for cluster", "namespace", ev.InvolvedObject.Namespace)
-		}
+		r.TriggerScaleUpForCluster(ev.InvolvedObject.Namespace)
+		// if err != nil {
+		// 	logger.Error(err, "Failed to trigger scale up for cluster", "namespace", ev.InvolvedObject.Namespace)
+		// }
 	}
 
 	// logger.Info("Event detected, enqueueing NamespaceQuota resources", "count", len(out), "eventNamespace", ev.InvolvedObject.Namespace, "eventMessage", ev.Message)
@@ -818,7 +962,25 @@ func (r *NamespaceQuotaReconciler) watchNodesCluster(ctx context.Context, obj cl
 	return out
 }
 
+func (r *NamespaceQuotaReconciler) allowScale(namespace string, minInterval time.Duration) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	last, exists := r.lastScale[namespace]
+	now := time.Now()
+
+	if exists && now.Sub(last) < minInterval {
+		return false
+	}
+
+	// Update timestamp
+	r.lastScale[namespace] = now
+	return true
+}
 func (r *NamespaceQuotaReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.lastScale == nil {
+		r.lastScale = make(map[string]time.Time)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(
 			&scalingv1.NamespaceQuota{}).
