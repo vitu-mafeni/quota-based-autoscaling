@@ -120,8 +120,8 @@ func RunQuotaBasedScalingServer(store *HeartbeatStore, addr string, Mgmtk8sClien
 			return
 		}
 
-		fmt.Println("RAW BODY:")
-		fmt.Println(string(body))
+		// fmt.Println("RAW BODY:")
+		// fmt.Println(string(body))
 
 		// Universal Kubernetes decoder
 		obj, gvk, err := yamlDecode(body)

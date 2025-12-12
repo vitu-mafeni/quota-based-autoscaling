@@ -173,6 +173,8 @@ export GIT_SECRET_NAME="git-user-secret"
 export GIT_SECRET_NAMESPACE="default"
 # On management cluster, this variable has to be set
 export SERVER_TYPE="MGMT"
+# on the workload cluster, apply this environment variable for the IP and port of the REST API
+export API_ENDPOINT="http://52.77.236.48:8000"
 ```
 ### 3. The operator has to be installed on management cluster and workload cluster 
 - The package used for testing is in workloads/general/quota-scaling-app
